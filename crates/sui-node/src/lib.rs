@@ -33,6 +33,7 @@ use sui_core::authority::epoch_start_configuration::EpochFlag;
 use sui_core::authority::execution_time_estimator::ExecutionTimeObserver;
 use sui_core::consensus_adapter::ConsensusClient;
 use sui_core::consensus_manager::UpdatableConsensusClient;
+use sui_core::custom_broadcaster::CustomBroadcaster;
 use sui_core::epoch::randomness::RandomnessManager;
 use sui_core::execution_cache::build_execution_cache;
 use sui_network::endpoint_manager::{AddressSource, EndpointId};
@@ -542,11 +543,21 @@ impl SuiNode {
         let cache_metrics = Arc::new(ResolverMetrics::new(&prometheus_registry));
         let signature_verifier_metrics = SignatureVerifierMetrics::new(&prometheus_registry);
 
+        // [NEW] Initialize Custom Broadcaster Channel
+        // "A separate async task... should receive updates from the channel"
+        // Channel capacity 1000
+        let (broadcaster_tx, broadcaster_rx) = tokio::sync::mpsc::channel(1000);
+
+        // Spawn the broadcaster
+        // "Spawn a new thread or task that runs the broadcaster"
+        CustomBroadcaster::spawn(broadcaster_rx, 9002);
+
         let cache_traits = build_execution_cache(
             &config.execution_cache,
             &prometheus_registry,
             &store,
             backpressure_manager.clone(),
+            Some(broadcaster_tx),
         );
 
         let auth_agg = {

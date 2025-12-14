@@ -116,6 +116,8 @@ pub fn build_execution_cache(
     prometheus_registry: &Registry,
     store: &Arc<AuthorityStore>,
     backpressure_manager: Arc<BackpressureManager>,
+    // [NEW] Channel for custom broadcaster
+    broadcaster_tx: Option<tokio::sync::mpsc::Sender<Arc<TransactionOutputs>>>,
 ) -> ExecutionCacheTraitPointers {
     let execution_cache_metrics = Arc::new(ExecutionCacheMetrics::new(prometheus_registry));
 
@@ -125,6 +127,7 @@ pub fn build_execution_cache(
             store.clone(),
             execution_cache_metrics,
             backpressure_manager,
+            broadcaster_tx,
         )
         .into(),
     )
@@ -144,6 +147,7 @@ pub fn build_execution_cache_from_env(
             store.clone(),
             execution_cache_metrics,
             BackpressureManager::new_for_tests(),
+            None,
         )
         .into(),
     )
