@@ -946,6 +946,19 @@ impl WritebackCache {
             epoch_id.saturating_sub(1)
         );
 
+        // [NEW] Custom Broadcaster Hook
+        if let Some(tx) = &self.broadcaster_tx {
+            if let Err(e) = tx.try_send(tx_outputs.clone()) {
+                // It is expected that this channel might be full if clients are slow
+                // We log at debug or warn depending on preference
+                tracing::debug!(
+                    "CustomBroadcaster: dropping update for {:?}: {}",
+                    tx_digest,
+                    e
+                );
+            }
+        }
+
         self.dirty.fastpath_transaction_outputs.remove(&tx_digest);
 
         let TransactionOutputs {
