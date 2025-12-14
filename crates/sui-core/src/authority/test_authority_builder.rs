@@ -276,6 +276,7 @@ impl<'a> TestAuthorityBuilder<'a> {
             &registry,
             &authority_store,
             backpressure_manager.clone(),
+            None,
         );
 
         let chain_id = ChainIdentifier::from(*genesis.checkpoint().digest());
