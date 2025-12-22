@@ -1,18 +1,19 @@
+use crate::liquidity_decoder::{self, LiquidityPoolState, LiquiditySubscription};
 use crate::transaction_outputs::TransactionOutputs;
 use axum::{
-    Router,
     extract::{
-        State,
         ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
     },
     response::IntoResponse,
     routing::get,
+    Router,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 use sui_types::{
     base_types::{ObjectID, SuiAddress},
-    transaction::TransactionDataAPI, // Kept if needed for trait bounds, but suppressing warning if unused
+    transaction::TransactionDataAPI,
 };
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
@@ -24,6 +25,8 @@ pub enum SubscriptionRequest {
     SubscribePool(ObjectID),
     SubscribeAccount(SuiAddress),
     SubscribeAll,
+    /// Subscribe to liquidity pool updates with filtering
+    SubscribeLiquidity(LiquiditySubscription),
 }
 
 // ... (StreamMessage and AppState remain unchanged, I will skip them in replacement if possible, but I need to target the enum first)
@@ -58,6 +61,16 @@ pub enum StreamMessage {
         type_: String,
         contents: Vec<u8>,
         digest: String,
+    },
+    /// Decoded liquidity pool update
+    LiquidityUpdate {
+        pool_id: ObjectID,
+        pool_type: String,
+        digest: String,
+        /// Decoded pool state (protocol, tokens, fields)
+        decoded_state: Option<LiquidityPoolState>,
+        /// Raw object bytes if requested
+        raw_bytes: Option<Vec<u8>>,
     },
     // Raw output for advanced filtering
     Raw(SerializableOutput),
@@ -144,6 +157,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let mut subscriptions_pools = HashSet::new();
     let mut subscriptions_accounts = HashSet::new();
     let mut subscribe_all = false;
+    let mut liquidity_subscription: Option<LiquiditySubscription> = None;
 
     loop {
         tokio::select! {
@@ -223,6 +237,53 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                          // Note: Explicit BalanceChange extraction would require parsing the Move objects
                          // in `outputs.written` to see if they are Coin<T> owned by `sender` and what their value is.
                          // This is complex without a resolver. For now, AccountActivity gives the trigger.
+
+                         // 5. Liquidity Pool Updates
+                         // Filter and stream liquidity pool state changes
+                         if let Some(ref liq_sub) = liquidity_subscription {
+                             for (id, object) in &outputs.written {
+                                 if let Some(move_obj) = object.data.try_as_move() {
+                                     let type_str = move_obj.type_().to_string();
+
+                                     // Check if type matches any subscribed pattern
+                                     let type_matches = liquidity_decoder::matches_liquidity_pattern(
+                                         &type_str,
+                                         &liq_sub.type_patterns,
+                                     );
+
+                                     // Check if pool ID matches (if specific IDs were requested)
+                                     let id_matches = liq_sub.pool_ids.as_ref().map_or(
+                                         true,
+                                         |ids| ids.iter().any(|pid| pid == &id.to_string()),
+                                     );
+
+                                     if type_matches && id_matches {
+                                         let decoded_state = liquidity_decoder::decode_liquidity_state(
+                                             move_obj,
+                                             &type_str,
+                                         );
+
+                                         let raw_bytes = if liq_sub.include_raw_bytes {
+                                             Some(move_obj.contents().to_vec())
+                                         } else {
+                                             None
+                                         };
+
+                                         let msg = StreamMessage::LiquidityUpdate {
+                                             pool_id: *id,
+                                             pool_type: type_str,
+                                             digest: digest.to_string(),
+                                             decoded_state,
+                                             raw_bytes,
+                                         };
+
+                                         if send_json(&mut socket, &msg).await.is_err() {
+                                             break;
+                                         }
+                                     }
+                                 }
+                             }
+                         }
                     }
                     Err(_) => break, // Channel closed
                 }
@@ -245,6 +306,11 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                     }
                                     SubscriptionRequest::SubscribeAll => {
                                         subscribe_all = true;
+                                    }
+                                    SubscriptionRequest::SubscribeLiquidity(sub) => {
+                                        info!("CustomBroadcaster: Client subscribed to Liquidity pools with {} patterns",
+                                            sub.type_patterns.len());
+                                        liquidity_subscription = Some(sub);
                                     }
                                 }
                             }
