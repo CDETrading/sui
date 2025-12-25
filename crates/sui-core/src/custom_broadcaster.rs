@@ -91,6 +91,7 @@ pub enum StreamMessage {
         digest: String,
         object: Option<Vec<u8>>, // Field<K,V> 的序列化資料
         object_type: Option<String>,
+        object: Option<Vec<u8>>,
     },
 
     /// Account activity notification
@@ -994,6 +995,79 @@ async fn query_all_fields_cached(
                 loop {
                     if let Some(entry) = cache.get(&table_id) {
                         if matches!(entry.value().0, CacheStatus::Ready) {
+                         // 2. Events Broadcast
+                         // If subscribe_all is true, we send all events.
+                         // In the future, we can add filter sets for events.
+                         if subscribe_all {
+                             for event in &outputs.events.data {
+                                 let msg = StreamMessage::Event {
+                                     package_id: event.package_id,
+                                     transaction_module: event.transaction_module.to_string(),
+                                     sender: event.sender,
+                                     type_: event.type_.to_string(),
+                                     contents: event.contents.clone(),
+                                     digest: digest.to_string(),
+                                 };
+                                 if let Err(_) = send_json(&mut socket, &msg).await { break; }
+                             }
+                         }
+
+                         // 3. Pool Updates (Written Objects)
+                         // We iterate through written objects to see if any match our subscribed pools
+                         for (id, object) in &outputs.written {
+                             if subscriptions_pools.contains(id) {
+                                  let object_bytes = object.data.try_as_move().map(|o| o.contents().to_vec());
+                                  let msg = StreamMessage::PoolUpdate {
+                                      pool_id: *id,
+                                      digest: digest.to_string(),
+                                      object: object_bytes,
+                                  };
+                                  if let Err(_) = send_json(&mut socket, &msg).await { break; }
+                             }
+                         }
+
+                         // 4. Account Updates (Sender)
+                         // Check if the sender is one of our subscribed accounts
+                         let sender = outputs.transaction.sender_address();
+                         if subscriptions_accounts.contains(&sender) {
+                             info!("CustomBroadcaster: Match found for Account {}", sender);
+                             let msg = StreamMessage::AccountActivity {
+                                 account: sender,
+                                 digest: digest.to_string(),
+                                 kind: "Transaction".to_string(),
+                             };
+                             if let Err(_) = send_json(&mut socket, &msg).await { break; }
+                         }
+
+                         // Note: Explicit BalanceChange extraction would require parsing the Move objects
+                         // in `outputs.written` to see if they are Coin<T> owned by `sender` and what their value is.
+                         // This is complex without a resolver. For now, AccountActivity gives the trigger.
+                    }
+                    Err(_) => break, // Channel closed
+                }
+            }
+
+            // Inbound: Handle subscriptions
+            res = socket.recv() => {
+                match res {
+                    Some(Ok(msg)) => {
+                        if let Message::Text(text) = msg {
+                            if let Ok(req) = serde_json::from_str::<SubscriptionRequest>(&text) {
+                                info!("Client subscribed: {:?}", req);
+                                match req {
+                                    SubscriptionRequest::SubscribePool(id) => {
+                                        subscriptions_pools.insert(id);
+                                    }
+                                    SubscriptionRequest::SubscribeAccount(addr) => {
+                                        info!("CustomBroadcaster: Client subscribed to Account {}", addr);
+                                        subscriptions_accounts.insert(addr);
+                                    }
+                                    SubscriptionRequest::SubscribeAll => {
+                                        subscribe_all = true;
+                                    }
+                                }
+                            }
+                        } else if let Message::Close(_) = msg {
                             break;
                         }
                     }
