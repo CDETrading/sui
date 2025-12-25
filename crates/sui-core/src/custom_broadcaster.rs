@@ -39,7 +39,7 @@ pub enum StreamMessage {
     PoolUpdate {
         pool_id: ObjectID,
         digest: String,
-        object: Option<serde_json::Value>,
+        object: Option<Vec<u8>>,
     },
     AccountActivity {
         account: SuiAddress,
@@ -197,7 +197,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                          // We iterate through written objects to see if any match our subscribed pools
                          for (id, object) in &outputs.written {
                              if subscriptions_pools.contains(id) {
-                                  let object_bytes = object.data.try_as_move().map(|o| o.json());
+                                  let object_bytes = object.data.try_as_move().map(|o| o.contents().to_vec());
                                   let msg = StreamMessage::PoolUpdate {
                                       pool_id: *id,
                                       digest: digest.to_string(),
