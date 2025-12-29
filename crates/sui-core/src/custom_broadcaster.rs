@@ -10,36 +10,42 @@ use axum::{
 };
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{HashMap, HashSet},
-    net::SocketAddr,
-    sync::Arc,
-    time::SystemTime,
-};
-use sui_types::object::Owner;
+use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::SystemTime};
 use sui_types::{
     base_types::{ObjectID, SuiAddress},
+    object::Object,
     object::Object,
 };
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
-use crate::authority::AuthorityStore;
-use crate::authority::authority_store_tables::LiveObject;
+
 // --- Configuration ---
 
 /// Known CLMM pool package IDs (Cetus, etc.)
 /// These are the package addresses that contain pool::Pool types
-const KNOWN_POOL_MODULES: &[&str] = &["pool", "clmm_pool"];
+const KNOWN_POOL_MODULES: &[&str] = &[
+    "pool",
+    "clmm_pool",
+];
 
-const KNOWN_POOL_NAMES: &[&str] = &["Pool"];
+const KNOWN_POOL_NAMES: &[&str] = &[
+    "Pool",
+];
 
-const KNOWN_TICK_MODULES: &[&str] = &["tick", "tick_manager"];
+const KNOWN_TICK_MODULES: &[&str] = &[
+    "tick",
+    "tick_manager",
+];
 
-const KNOWN_TICK_NAMES: &[&str] = &["TickInfo", "Tick"];
+const KNOWN_TICK_NAMES: &[&str] = &[
+    "TickInfo",
+    "Tick",
+];
 
 // --- Subscription Request Types (JSON format matching user spec) ---
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
 #[serde(tag = "type")]
 pub enum SubscriptionRequest {
     #[serde(rename = "subscribe_pool")]
@@ -49,26 +55,18 @@ pub enum SubscriptionRequest {
     SubscribeAccount { address: String },
 
     #[serde(rename = "subscribe_all")]
+    #[serde(rename = "subscribe_pool")]
+    SubscribePool { pool_id: String },
+
+    #[serde(rename = "subscribe_account")]
+    SubscribeAccount { address: String },
+
+    #[serde(rename = "subscribe_all")]
     SubscribeAll,
-
-    #[serde(rename = "query_all_fields")]
-    QueryAllFields { table_id: ObjectID },
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct SerializableOutput {
-    pub digest: String,
-    pub timestamp_ms: u64,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct FieldData {
-    pub field_id: ObjectID,
-    pub object_bytes: Vec<u8>,
-    pub object_type: String,
-}
-    
 // --- Stream Message Types ---
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type")]
 pub enum StreamMessage {
@@ -78,19 +76,16 @@ pub enum StreamMessage {
 
     /// Legacy pool update (raw bytes)
     #[serde(rename = "pool_update")]
+    /// Pool state update with liquidity, sqrt_price, tick_index, and tick updates
+    #[serde(rename = "tx_pool_state")]
+    TxPoolState(TxPoolStatePayload),
+
+    /// Legacy pool update (raw bytes)
+    #[serde(rename = "pool_update")]
     PoolUpdate {
         pool_id: String,
+        pool_id: String,
         digest: String,
-        object: Option<Vec<u8>>,
-        object_type: Option<String>,
-    },
-
-    FieldUpdate {
-        pool_id: ObjectID,  // Parent table ID
-        field_id: ObjectID, // Field object ID
-        digest: String,
-        object: Option<Vec<u8>>, // Field<K,V> 的序列化資料
-        object_type: Option<String>,
         object: Option<Vec<u8>>,
     },
 
@@ -98,44 +93,44 @@ pub enum StreamMessage {
     #[serde(rename = "account_activity")]
     AccountActivity {
         account: String,
+        account: String,
         digest: String,
+        kind: String,
         kind: String,
     },
 
     /// Balance change notification
     #[serde(rename = "balance_change")]
+
+    /// Balance change notification
+    #[serde(rename = "balance_change")]
     BalanceChange {
         account: String,
+        account: String,
         coin_type: String,
+        new_balance: String,
         new_balance: String,
     },
 
     /// Event notification
     #[serde(rename = "event")]
+
+    /// Event notification
+    #[serde(rename = "event")]
     Event {
         package_id: String,
+        package_id: String,
         transaction_module: String,
+        sender: String,
         sender: String,
         type_: String,
         contents: Vec<u8>,
         digest: String,
     },
 
-    #[serde(rename = "all_fields_response")]
-    AllFieldsResponse {
-        table_id: ObjectID,
-        fields: Vec<FieldData>,
-        total_count: usize,
-    },
-
     /// Error message
     #[serde(rename = "error")]
     Error { message: String },
-
-    /// Raw output (for debugging)
-    #[serde(rename = "raw")]
-    Raw(SerializableOutput),
-
 }
 
 /// Payload for pool state updates
@@ -184,34 +179,40 @@ pub struct ExtractedPoolData {
 }
 
 /// Extracted tick data from BCS-encoded Move object
-/// Uses SuiAddress for parent_owner since Owner::ObjectOwner contains SuiAddress
 #[derive(Debug, Clone)]
 pub struct ExtractedTickData {
-    pub parent_owner: SuiAddress,
+    pub pool_id: ObjectID,  // Parent pool ID (from dynamic field)
     pub tick_index: i32,
     pub liquidity_gross: u128,
     pub liquidity_net: i128,
 }
 
-fn is_momentum_tickinfo(ty: &str) -> bool {
-    ty.ends_with("::tick::TickInfo")
-}
-
-fn is_cetus_tick(ty: &str) -> bool {
-    ty.ends_with("::tick::Tick")
-}
-
 /// Check if a type looks like a CLMM pool based on module/name patterns
 fn is_pool_type(module: &str, name: &str) -> bool {
-    KNOWN_POOL_MODULES.iter().any(|m| module.contains(m)) && KNOWN_POOL_NAMES.contains(&name)
+    KNOWN_POOL_MODULES.iter().any(|m| module.contains(m))
+        && KNOWN_POOL_NAMES.contains(&name)
 }
 
 /// Check if a type looks like a tick info based on module/name patterns
 fn is_tick_type(module: &str, name: &str) -> bool {
-    KNOWN_TICK_MODULES.iter().any(|m| module.contains(m)) && KNOWN_TICK_NAMES.contains(&name)
+    KNOWN_TICK_MODULES.iter().any(|m| module.contains(m))
+        && KNOWN_TICK_NAMES.contains(&name)
 }
 
 /// Try to extract pool data from a Move object
+///
+/// CLMM Pool struct typically has this layout (Cetus example):
+/// struct Pool<CoinTypeA, CoinTypeB> has key, store {
+///     id: UID,                          // 32 bytes
+///     coin_a: Balance<CoinTypeA>,       // 8 bytes (value only)
+///     coin_b: Balance<CoinTypeB>,       // 8 bytes (value only)
+///     tick_spacing: u32,                // 4 bytes
+///     fee_rate: u64,                    // 8 bytes
+///     liquidity: u128,                  // 16 bytes
+///     current_sqrt_price: u128,         // 16 bytes
+///     current_tick_index: I32,          // 4 bytes (signed)
+///     ...
+/// }
 fn try_extract_pool_data(object: &Object) -> Option<ExtractedPoolData> {
     let move_obj = object.data.try_as_move()?;
     let type_ = move_obj.type_();
@@ -226,6 +227,8 @@ fn try_extract_pool_data(object: &Object) -> Option<ExtractedPoolData> {
     let contents = move_obj.contents();
     let pool_id = object.id();
 
+    // Try to extract fields from the BCS bytes
+    // This is a best-effort extraction that works with common CLMM pool layouts
     if let Some((sqrt_price, tick_index, liquidity)) = try_parse_pool_fields(contents) {
         debug!(
             "Extracted pool data: pool_id={}, sqrt_price={}, tick_index={}, liquidity={}",
@@ -239,6 +242,8 @@ fn try_extract_pool_data(object: &Object) -> Option<ExtractedPoolData> {
         });
     }
 
+    // Fallback: return with placeholder values if we can identify it's a pool
+    // but can't parse the exact fields
     warn!(
         "Identified pool {} but couldn't parse fields (module={}, name={})",
         pool_id, module, name
@@ -249,22 +254,39 @@ fn try_extract_pool_data(object: &Object) -> Option<ExtractedPoolData> {
 /// Try to parse pool fields from BCS bytes
 /// Returns (sqrt_price, tick_index, liquidity) if successful
 fn try_parse_pool_fields(contents: &[u8]) -> Option<(u128, i32, u128)> {
+    // Minimum size check: UID (32) + at least some fields
     if contents.len() < 80 {
         return None;
     }
 
+    // Strategy: scan for patterns that look like sqrt_price (u128), tick_index (i32), liquidity (u128)
+    // Common offsets in CLMM pools vary, so we try multiple strategies
+
     // Strategy 1: Cetus-style layout
+    // After UID (32 bytes), there may be:
+    // - coin_a balance (8 bytes)
+    // - coin_b balance (8 bytes)
+    // - tick_spacing (4 bytes)
+    // - fee_rate (8 bytes)
+    // - liquidity (16 bytes) at offset 60
+    // - current_sqrt_price (16 bytes) at offset 76
+    // - current_tick_index (4 bytes) at offset 92
+
     if contents.len() >= 96 {
+        // Try Cetus-style offsets
         let liquidity = try_read_u128(contents, 60)?;
         let sqrt_price = try_read_u128(contents, 76)?;
         let tick_index = try_read_i32(contents, 92)?;
 
+        // Sanity checks for CLMM values
         if sqrt_price > 0 && liquidity < u128::MAX / 2 {
             return Some((sqrt_price, tick_index, liquidity));
         }
     }
 
     // Strategy 2: Alternative layout - search for sqrt_price pattern
+    // sqrt_price in Q64.64 format is typically between 2^32 and 2^192
+    // Look for consecutive u128 values that look reasonable
     for offset in (32..contents.len().saturating_sub(40)).step_by(8) {
         if let Some(sqrt_price) = try_read_u128(contents, offset)
             && sqrt_price >= (1u128 << 32)
@@ -290,14 +312,6 @@ fn try_read_u128(data: &[u8], offset: usize) -> Option<u128> {
     Some(u128::from_le_bytes(bytes))
 }
 
-fn try_read_i128_le(data: &[u8], offset: usize) -> Option<i128> {
-    if offset + 16 > data.len() {
-        return None;
-    }
-    let bytes: [u8; 16] = data[offset..offset + 16].try_into().ok()?;
-    Some(i128::from_le_bytes(bytes))
-}
-
 fn try_read_i32(data: &[u8], offset: usize) -> Option<i32> {
     if offset + 4 > data.len() {
         return None;
@@ -308,249 +322,155 @@ fn try_read_i32(data: &[u8], offset: usize) -> Option<i32> {
 
 /// Try to extract tick data from a dynamic field object
 fn try_extract_tick_data(object: &Object) -> Option<ExtractedTickData> {
-    // Get parent owner address - Owner::ObjectOwner contains SuiAddress
-    let parent_owner: SuiAddress = match object.owner() {
-        Owner::ObjectOwner(addr) => *addr,
-        _ => return None,
-    };
-
     let move_obj = object.data.try_as_move()?;
     let type_ = move_obj.type_();
+
     let module = type_.module().as_str();
     let name = type_.name().as_str();
 
-    // Case A: dynamic_field::Field<...>
+    // Check if this is a dynamic field containing tick info
+    // Dynamic fields have type: 0x2::dynamic_field::Field<K, V>
     if module == "dynamic_field" && name == "Field" {
+        // Try to parse the inner value type to see if it's a tick
         let type_str = type_.to_string();
         if type_str.contains("TickInfo") || type_str.contains("::tick::") {
-            return try_parse_tick_from_dynamic_field(parent_owner, object);
+            return try_parse_tick_from_dynamic_field(object);
         }
     }
 
-    // Case B: Direct Tick / TickInfo
-    if is_tick_type(module, name)
-        || is_momentum_tickinfo(&type_.to_string())
-        || is_cetus_tick(&type_.to_string())
-    {
-        return try_parse_direct_tick(parent_owner, object);
+    // Direct tick object (less common)
+    if is_tick_type(module, name) {
+        return try_parse_direct_tick(object);
     }
 
     None
 }
 
-fn try_parse_tick_from_dynamic_field(
-    parent_owner: SuiAddress,
-    object: &Object,
-) -> Option<ExtractedTickData> {
+fn try_parse_tick_from_dynamic_field(object: &Object) -> Option<ExtractedTickData> {
     let move_obj = object.data.try_as_move()?;
     let contents = move_obj.contents();
 
-    // Minimum size: UID(32) + key(4) + liquidity_gross(16) + liquidity_net(16)
-    if contents.len() < 32 + 4 + 16 + 16 {
+    // Dynamic field layout:
+    // - UID (32 bytes)
+    // - name/key (variable, but for I32 tick index it's typically 4 bytes)
+    // - value (TickInfo struct)
+
+    if contents.len() < 56 {
         return None;
     }
 
+    // Try to extract tick index from the key portion (after UID)
     let tick_index = try_read_i32(contents, 32)?;
 
-    // value: TickInfo { liquidity_gross: u128, liquidity_net: i128, ... }
-    let value_offset = 36;
-    let liquidity_gross = try_read_u128(contents, value_offset)?;
-    let liquidity_net = try_read_i128_le(contents, value_offset + 16)?;
+    // Try to find liquidity values in the remaining bytes
+    // TickInfo typically has: liquidity_gross (u128), liquidity_net (i128), ...
+    let offset = 36; // After UID + I32 key
 
-    Some(ExtractedTickData {
-        parent_owner,
-        tick_index,
-        liquidity_gross,
-        liquidity_net,
-    })
+    if contents.len() >= offset + 32 {
+        let liquidity_gross = try_read_u128(contents, offset)?;
+        let liquidity_net_bytes = try_read_u128(contents, offset + 16)?;
+        let liquidity_net = liquidity_net_bytes as i128;
+
+        // Get parent ID from object reference or use object's own ID as placeholder
+        let pool_id = object.id();
+
+        return Some(ExtractedTickData {
+            pool_id,
+            tick_index,
+            liquidity_gross,
+            liquidity_net,
+        });
+    }
+
+    None
 }
 
-fn try_parse_direct_tick(parent_owner: SuiAddress, object: &Object) -> Option<ExtractedTickData> {
+fn try_parse_direct_tick(object: &Object) -> Option<ExtractedTickData> {
     let move_obj = object.data.try_as_move()?;
     let contents = move_obj.contents();
 
-    if contents.len() < 32 + 4 + 16 + 16 {
+    if contents.len() < 48 {
         return None;
     }
 
+    // Direct TickInfo layout (after UID):
+    // - tick_index or other identifier
+    // - liquidity_gross (u128)
+    // - liquidity_net (i128)
+
+    let pool_id = object.id();
     let tick_index = try_read_i32(contents, 32)?;
     let liquidity_gross = try_read_u128(contents, 36)?;
-    let liquidity_net = try_read_i128_le(contents, 52)?;
+    let liquidity_net = try_read_u128(contents, 52)? as i128;
 
     Some(ExtractedTickData {
-        parent_owner,
+        pool_id,
         tick_index,
         liquidity_gross,
         liquidity_net,
     })
-}
-
-/// Convert SuiAddress to 32 bytes for pattern matching in pool contents
-fn sui_address_to_bytes(addr: &SuiAddress) -> [u8; 32] {
-    let s = addr.to_string();
-    let s = s.strip_prefix("0x").unwrap_or(&s);
-    hex_decode_to_32_bytes(s)
-}
-
-/// Manual hex decode without external crate - returns 32 bytes (zero-padded on left)
-fn hex_decode_to_32_bytes(hex_str: &str) -> [u8; 32] {
-    fn hex_val(c: u8) -> u8 {
-        match c {
-            b'0'..=b'9' => c - b'0',
-            b'a'..=b'f' => c - b'a' + 10,
-            b'A'..=b'F' => c - b'A' + 10,
-            _ => 0,
-        }
-    }
-
-    let mut out = [0u8; 32];
-    let sb = hex_str.as_bytes();
-    let bytes_len = sb.len() / 2;
-    let start = 32usize.saturating_sub(bytes_len);
-
-    let mut i = 0usize;
-    let mut o = start;
-
-    while i + 1 < sb.len() && o < 32 {
-        let hi = hex_val(sb[i]);
-        let lo = hex_val(sb[i + 1]);
-        out[o] = (hi << 4) | lo;
-        i += 2;
-        o += 1;
-    }
-
-    out
 }
 
 /// Extract pool and tick changes from transaction outputs
-pub fn extract_pool_tick_changes(outputs: &TransactionOutputs) -> Option<TxPoolStatePayload> {
+pub fn extract_pool_tick_changes(
+    outputs: &TransactionOutputs,
+) -> Option<TxPoolStatePayload> {
     let tx_digest = outputs.transaction.digest().to_string();
     let ts_ms = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
-    // 1) Collect pool updates + pool BCS contents for owner->pool mapping
     let mut pool_updates: Vec<PoolStateUpdate> = Vec::new();
-    let mut pool_contents_by_id: HashMap<ObjectID, Vec<u8>> = HashMap::new();
+    let mut tick_updates_by_pool: std::collections::HashMap<ObjectID, Vec<TickUpdate>> =
+        std::collections::HashMap::new();
 
-    // 2) Collect tick data
-    let mut extracted_ticks: Vec<ExtractedTickData> = Vec::new();
-    let mut tick_owner_candidates: HashSet<SuiAddress> = HashSet::new();
-
-    let mut pool_count = 0usize;
-    let mut tick_count = 0usize;
-
+    // First pass: extract all pool and tick data from written objects
     for object in outputs.written.values() {
-        // Try pool extraction
+        // Try to extract pool data
         if let Some(pool_data) = try_extract_pool_data(object) {
-            pool_count += 1;
             pool_updates.push(PoolStateUpdate {
                 pool_id: pool_data.pool_id.to_string(),
                 sqrt_price: pool_data.sqrt_price.to_string(),
                 tick_index: pool_data.tick_index,
                 liquidity: pool_data.liquidity.to_string(),
-                ticks: Vec::new(),
+                ticks: Vec::new(), // Will be populated in second pass
             });
-
-            if let Some(m) = object.data.try_as_move() {
-                pool_contents_by_id.insert(pool_data.pool_id, m.contents().to_vec());
-            }
         }
 
-        // Try tick extraction
-        if let Some(tick) = try_extract_tick_data(object) {
-            tick_count += 1;
-            tick_owner_candidates.insert(tick.parent_owner);
-            extracted_ticks.push(tick);
-        }
-    }
-
-    debug!(
-        "extract_pool_tick_changes: found {} pools, {} ticks",
-        pool_count, tick_count
-    );
-
-    // If no pool updates, don't send
-    if pool_updates.is_empty() {
-        return None;
-    }
-
-    // 3) Build owner->pool mapping (best-effort)
-    let owner_to_pool = build_owner_to_pool_map(&pool_contents_by_id, &tick_owner_candidates);
-
-    let mapping_success = owner_to_pool.len();
-    let mapping_total = tick_owner_candidates.len();
-    debug!(
-        "owner->pool mapping: {}/{} successful",
-        mapping_success, mapping_total
-    );
-
-    // 4) Attach ticks to their pools
-    let mut tick_updates_by_pool: HashMap<ObjectID, Vec<TickUpdate>> = HashMap::new();
-
-    for t in extracted_ticks {
-        // Try to find the pool this tick belongs to
-        let pool_id_opt = owner_to_pool.get(&t.parent_owner).copied();
-
-        if let Some(pool_id) = pool_id_opt {
+        // Try to extract tick data
+        if let Some(tick_data) = try_extract_tick_data(object) {
             tick_updates_by_pool
-                .entry(pool_id)
+                .entry(tick_data.pool_id)
                 .or_default()
                 .push(TickUpdate {
-                    tick_index: t.tick_index,
-                    liquidity_gross: t.liquidity_gross.to_string(),
-                    liquidity_net: t.liquidity_net.to_string(),
+                    tick_index: tick_data.tick_index,
+                    liquidity_gross: tick_data.liquidity_gross.to_string(),
+                    liquidity_net: tick_data.liquidity_net.to_string(),
                 });
         }
-        // If no mapping found, we skip this tick (can't reliably attribute it)
     }
 
+    // Second pass: attach tick updates to their pools
     for update in &mut pool_updates {
-        if let Ok(pool_id) = update.pool_id.parse::<ObjectID>() {
-            if let Some(ticks) = tick_updates_by_pool.remove(&pool_id) {
-                update.ticks = ticks;
-            }
+        if let Ok(pool_id) = update.pool_id.parse::<ObjectID>()
+            && let Some(ticks) = tick_updates_by_pool.remove(&pool_id)
+        {
+            update.ticks = ticks;
         }
+    }
+
+    // Return None if no pool updates found
+    if pool_updates.is_empty() {
+        return None;
     }
 
     Some(TxPoolStatePayload {
         ts_ms,
         tx_digest,
-        checkpoint_seq: None,
+        checkpoint_seq: None, // Not available before commit
         updates: pool_updates,
     })
-}
-
-/// Build best-effort owner->pool mapping:
-/// If tick entry's owner (usually table object) bytes are found in pool contents,
-/// we assume that table belongs to that pool.
-fn build_owner_to_pool_map(
-    pool_contents_by_id: &HashMap<ObjectID, Vec<u8>>,
-    candidate_owners: &HashSet<SuiAddress>,
-) -> HashMap<SuiAddress, ObjectID> {
-    let mut map = HashMap::new();
-
-    for owner_addr in candidate_owners {
-        let needle = sui_address_to_bytes(owner_addr);
-
-        // Find first pool that contains this address bytes
-        for (pool_id, contents) in pool_contents_by_id {
-            if contains_subslice(contents, &needle) {
-                map.insert(*owner_addr, *pool_id);
-                break;
-            }
-        }
-    }
-
-    map
-}
-
-fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return false;
-    }
-    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 // --- Broadcaster State ---
@@ -584,7 +504,9 @@ struct AppState {
 pub struct CustomBroadcaster;
 
 impl CustomBroadcaster {
-    pub fn spawn(mut rx: mpsc::Receiver<Arc<TransactionOutputs>>, authority_store: Arc<AuthorityStore>, port: u16) {
+    pub fn spawn(mut rx: mpsc::Receiver<Arc<TransactionOutputs>>, port: u16) {
+        // Create a broadcast channel for all connected websocket clients
+        // Capacity 10000 to handle bursts without blocking
         let (tx, _) = broadcast::channel(10000);
         let tx_clone = tx.clone();
 
@@ -597,9 +519,8 @@ impl CustomBroadcaster {
         tokio::spawn(async move {
             info!("CustomBroadcaster: Ingestion loop started with write-through cache");
             while let Some(outputs) = rx.recv().await {
-                // Update cache for any written objects that are dynamic fields
-                Self::update_cache_from_outputs(&outputs, &fields_cache_clone);
-
+                // Broadcast the Arc directly to avoid cloning the heavy data structure
+                // Serialization happens in the client handling task
                 if let Err(e) = tx_clone.send(outputs) {
                     debug!(
                         "CustomBroadcaster: No active subscribers, dropped message: {}",
@@ -624,6 +545,7 @@ impl CustomBroadcaster {
                 .with_state(app_state);
 
             let addr = SocketAddr::from(([0, 0, 0, 0], port));
+            info!("CustomBroadcaster: WebSocket server listening on {}", addr);
             info!("CustomBroadcaster: WebSocket server listening on {}", addr);
 
             match tokio::net::TcpListener::bind(addr).await {
@@ -717,234 +639,184 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
 
     let mut subscriptions_pools: HashSet<ObjectID> = HashSet::new();
     let mut subscriptions_accounts: HashSet<SuiAddress> = HashSet::new();
+    let mut subscriptions_pools: HashSet<ObjectID> = HashSet::new();
+    let mut subscriptions_accounts: HashSet<SuiAddress> = HashSet::new();
     let mut subscribe_all = false;
+
+    info!("CustomBroadcaster: New WebSocket connection established");
 
     info!("CustomBroadcaster: New WebSocket connection established");
 
     loop {
         tokio::select! {
-                            res = rx.recv() => {
-                                match res {
-                                    Ok(outputs) => {
-                                        let digest = outputs.transaction.digest();
-                                        let sender = outputs.transaction.sender_address();
+            // Outbound: Send updates to client
+            res = rx.recv() => {
+                match res {
+                    Ok(outputs) => {
+                        let digest = outputs.transaction.digest();
+                        let sender = outputs.transaction.sender_address();
 
-                                        debug!(
-                                            "CustomBroadcaster: Processing Tx {} from Sender {} (AccSubs: {}, PoolSubs: {})",
-                                            digest, sender, subscriptions_accounts.len(), subscriptions_pools.len()
-                                        );
+                        debug!(
+                            "CustomBroadcaster: Processing Tx {} from Sender {} (AccSubs: {}, PoolSubs: {})",
+                            digest, sender, subscriptions_accounts.len(), subscriptions_pools.len()
+                        );
 
-                                        // 1. Try to extract and send pool state updates
-                                        if let Some(pool_payload) = extract_pool_tick_changes(&outputs) {
-                                            let should_send = subscribe_all || pool_payload.updates.iter().any(|u| {
-                                                u.pool_id.parse::<ObjectID>()
-                                                    .map(|id| subscriptions_pools.contains(&id))
-                                                    .unwrap_or(false)
-                                            });
+                        // 1. Try to extract and send pool state updates
+                        if let Some(pool_payload) = extract_pool_tick_changes(&outputs) {
+                            // Check if any pool in the update matches our subscriptions
+                            let should_send = subscribe_all || pool_payload.updates.iter().any(|u| {
+                                u.pool_id.parse::<ObjectID>()
+                                    .map(|id| subscriptions_pools.contains(&id))
+                                    .unwrap_or(false)
+                            });
 
-                                            if should_send {
-                                                let msg = StreamMessage::TxPoolState(pool_payload);
-                                                if send_json(&mut socket, &msg).await.is_err() {
-                                                    break;
-                                                }
-                                            }
-                                        }
-
-                                        // 2. Send legacy pool updates for subscribed pools (raw bytes)
-        for (id, object) in &outputs.written {
-            if subscriptions_pools.contains(id) {
-                let (object_bytes, object_type) = if let Some(move_obj) = object.data.try_as_move() {
-                    (
-                        Some(move_obj.contents().to_vec()),
-                        Some(move_obj.type_().to_string()),  // 獲取完整型別
-                    )
-                } else {
-                    (None, None)
-                };
-
-                let msg = StreamMessage::PoolUpdate {
-                    pool_id: id.to_string(),
-                    digest: digest.to_string(),
-                    object: object_bytes,
-                    object_type,  // 傳送型別資訊
-                };
-                if let Err(_) = send_json(&mut socket, &msg).await { break; }
-            }
-
-            // Dynamic field 檢查
-            if let sui_types::object::Owner::ObjectOwner(parent_addr) = &object.owner {
-                let parent_id = ObjectID::from(*parent_addr);
-                if subscriptions_pools.contains(&parent_id) {
-                    let (object_bytes, object_type) = if let Some(move_obj) = object.data.try_as_move() {
-                        (
-                            Some(move_obj.contents().to_vec()),
-                            Some(move_obj.type_().to_string()),
-                        )
-                    } else {
-                        (None, None)
-                    };
-
-                    let msg = StreamMessage::FieldUpdate {
-                        pool_id: parent_id,
-                        field_id: *id,
-                        digest: digest.to_string(),
-                        object: object_bytes,
-                        object_type,
-                    };
-                    if let Err(_) = send_json(&mut socket, &msg).await { break; }
-                }
-            }
-        }
-
-                                        // 3. Account activity for subscribe_all
-                                        if subscribe_all {
-                                            let msg = StreamMessage::AccountActivity {
-                                                account: sender.to_string(),
-                                                digest: digest.to_string(),
-                                                kind: "Transaction".to_string(),
-                                            };
-                                            if send_json(&mut socket, &msg).await.is_err() {
-                                                break;
-                                            }
-
-                                            for event in &outputs.events.data {
-                                                let msg = StreamMessage::Event {
-                                                    package_id: event.package_id.to_string(),
-                                                    transaction_module: event.transaction_module.to_string(),
-                                                    sender: event.sender.to_string(),
-                                                    type_: event.type_.to_string(),
-                                                    contents: event.contents.clone(),
-                                                    digest: digest.to_string(),
-                                                };
-                                                if send_json(&mut socket, &msg).await.is_err() {
-                                                    break;
-                                                }
-                                            }
-                                        }
-
-                                        // 4. Account activity for subscribed accounts
-                                        if subscriptions_accounts.contains(&sender) {
-                                            info!("CustomBroadcaster: Match found for Account {}", sender);
-                                            let msg = StreamMessage::AccountActivity {
-                                                account: sender.to_string(),
-                                                digest: digest.to_string(),
-                                                kind: "Transaction".to_string(),
-                                            };
-                                            if send_json(&mut socket, &msg).await.is_err() {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                                        warn!("CustomBroadcaster: Client lagged, skipped {} messages", n);
-                                    }
-                                    Err(broadcast::error::RecvError::Closed) => {
-                                        info!("CustomBroadcaster: Broadcast channel closed");
-                                        break;
-                                    }
+                            if should_send {
+                                let msg = StreamMessage::TxPoolState(pool_payload);
+                                if send_json(&mut socket, &msg).await.is_err() {
+                                    break;
                                 }
                             }
+                        }
 
-                            res = socket.recv() => {
-                                match res {
-                                    Some(Ok(msg)) => {
-                                        match msg {
-                                            Message::Text(text) => {
-                                                match serde_json::from_str::<SubscriptionRequest>(&text) {
-                                                    Ok(req) => {
-                                                        match req {
-                                                            SubscriptionRequest::SubscribePool { pool_id } => {
-                                                                match pool_id.parse::<ObjectID>() {
-                                                                    Ok(id) => {
-                                                                        info!("CustomBroadcaster: Client subscribed to Pool {}", id);
-                                                                        subscriptions_pools.insert(id);
-                                                                    }
-                                                                    Err(_) => {
-                                                                        let err_msg = StreamMessage::Error {
-                                                                            message: format!("Invalid pool_id: {}", pool_id),
-                                                                        };
-                                                                        let _ = send_json(&mut socket, &err_msg).await;
-                                                                    }
-                                                                }
-                                                            }
-                                                            SubscriptionRequest::SubscribeAccount { address } => {
-                                                                match address.parse::<SuiAddress>() {
-                                                                    Ok(addr) => {
-                                                                        info!("CustomBroadcaster: Client subscribed to Account {}", addr);
-                                                                        subscriptions_accounts.insert(addr);
-                                                                    }
-                                                                    Err(_) => {
-                                                                        let err_msg = StreamMessage::Error {
-                                                                            message: format!("Invalid address: {}", address),
-                                                                        };
-                                                                        let _ = send_json(&mut socket, &err_msg).await;
-                                                                    }
-                                                                }
-                                                            }
-                                                            SubscriptionRequest::SubscribeAll => {
-                                                                info!("CustomBroadcaster: Client subscribed to all updates");
-                                                                subscribe_all = true;
-                                                            }
+                        // 2. Send legacy pool updates for subscribed pools (raw bytes)
+                        for (id, object) in &outputs.written {
+                            if subscriptions_pools.contains(id) {
+                                let object_bytes = object.data.try_as_move().map(|o| o.contents().to_vec());
+                                let msg = StreamMessage::PoolUpdate {
+                                    pool_id: id.to_string(),
+                                    digest: digest.to_string(),
+                                    object: object_bytes,
+                                };
+                                if send_json(&mut socket, &msg).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
 
-                                                            SubscriptionRequest::QueryAllFields { table_id } => {
-                                                                info!("Client querying all fields for table: {}", table_id);
+                        // 3. Account activity for subscribe_all
+                        if subscribe_all {
+                            let msg = StreamMessage::AccountActivity {
+                                account: sender.to_string(),
+                                digest: digest.to_string(),
+                                kind: "Transaction".to_string(),
+                            };
+                            if send_json(&mut socket, &msg).await.is_err() {
+                                break;
+                            }
 
-                                                                // Use cached query (first request scans, subsequent requests serve from cache)
-                                                                let store = state.store.clone();
-                                                                let cache = state.fields_cache.clone();
-                                                                let scan_progress = state.scan_in_progress.clone();
+                            // Send all events
+                            for event in &outputs.events.data {
+                                let msg = StreamMessage::Event {
+                                    package_id: event.package_id.to_string(),
+                                    transaction_module: event.transaction_module.to_string(),
+                                    sender: event.sender.to_string(),
+                                    type_: event.type_.to_string(),
+                                    contents: event.contents.clone(),
+                                    digest: digest.to_string(),
+                                };
+                                if send_json(&mut socket, &msg).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
 
-                                                                match query_all_fields_cached(&store, table_id, &cache, &scan_progress).await {
-                                                                    Ok(fields) => {
-                                                                        let msg = StreamMessage::AllFieldsResponse {
-                                                                            table_id,
-                                                                            total_count: fields.len(),
-                                                                            fields,
-                                                                        };
-                                                                        if send_json(&mut socket, &msg).await.is_err() {
-                                                                            break;
-                                                                        }
-                                                                    }
-                                                                    Err(e) => {
-                                                                        error!("Failed to query fields: {:?}", e);
-                                                                        let err_msg = StreamMessage::Error {
-                                                                            message: format!("Failed to query fields: {}", e),
-                                                                        };
-                                                                        let _ = send_json(&mut socket, &err_msg).await;
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
+                        // 4. Account activity for subscribed accounts
+                        if subscriptions_accounts.contains(&sender) {
+                            info!("CustomBroadcaster: Match found for Account {}", sender);
+                            let msg = StreamMessage::AccountActivity {
+                                account: sender.to_string(),
+                                digest: digest.to_string(),
+                                kind: "Transaction".to_string(),
+                            };
+                            if send_json(&mut socket, &msg).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("CustomBroadcaster: Client lagged, skipped {} messages", n);
+                        // Continue processing, don't disconnect
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        info!("CustomBroadcaster: Broadcast channel closed");
+                        break;
+                    }
+                }
+            }
+
+            // Inbound: Handle subscriptions
+            res = socket.recv() => {
+                match res {
+                    Some(Ok(msg)) => {
+                        match msg {
+                            Message::Text(text) => {
+                                match serde_json::from_str::<SubscriptionRequest>(&text) {
+                                    Ok(req) => {
+                                        match req {
+                                            SubscriptionRequest::SubscribePool { pool_id } => {
+                                                match pool_id.parse::<ObjectID>() {
+                                                    Ok(id) => {
+                                                        info!("CustomBroadcaster: Client subscribed to Pool {}", id);
+                                                        subscriptions_pools.insert(id);
                                                     }
-                                                    Err(e) => {
+                                                    Err(_) => {
                                                         let err_msg = StreamMessage::Error {
-                                                            message: format!("Invalid subscription request: {}", e),
+                                                            message: format!("Invalid pool_id: {}", pool_id),
                                                         };
                                                         let _ = send_json(&mut socket, &err_msg).await;
                                                     }
                                                 }
                                             }
-                                            Message::Close(_) => {
-                                                info!("CustomBroadcaster: Client sent close frame");
-                                                break;
+                                            SubscriptionRequest::SubscribeAccount { address } => {
+                                                match address.parse::<SuiAddress>() {
+                                                    Ok(addr) => {
+                                                        info!("CustomBroadcaster: Client subscribed to Account {}", addr);
+                                                        subscriptions_accounts.insert(addr);
+                                                    }
+                                                    Err(_) => {
+                                                        let err_msg = StreamMessage::Error {
+                                                            message: format!("Invalid address: {}", address),
+                                                        };
+                                                        let _ = send_json(&mut socket, &err_msg).await;
+                                                    }
+                                                }
                                             }
-                                            Message::Ping(data) => {
-                                                let _ = socket.send(Message::Pong(data)).await;
+                                            SubscriptionRequest::SubscribeAll => {
+                                                info!("CustomBroadcaster: Client subscribed to all updates");
+                                                subscribe_all = true;
                                             }
-                                            _ => {}
                                         }
                                     }
-                                    Some(Err(e)) => {
-                                        warn!("CustomBroadcaster: WebSocket error: {}", e);
-                                        break;
-                                    }
-                                    None => {
-                                        info!("CustomBroadcaster: WebSocket stream ended");
-                                        break;
+                                    Err(e) => {
+                                        let err_msg = StreamMessage::Error {
+                                            message: format!("Invalid subscription request: {}", e),
+                                        };
+                                        let _ = send_json(&mut socket, &err_msg).await;
                                     }
                                 }
                             }
+                            Message::Close(_) => {
+                                info!("CustomBroadcaster: Client sent close frame");
+                                break;
+                            }
+                            Message::Ping(data) => {
+                                // Respond to ping with pong
+                                let _ = socket.send(Message::Pong(data)).await;
+                            }
+                            _ => {}
                         }
+                    }
+                    Some(Err(e)) => {
+                        warn!("CustomBroadcaster: WebSocket error: {}", e);
+                        break;
+                    }
+                    None => {
+                        info!("CustomBroadcaster: WebSocket stream ended");
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     info!("CustomBroadcaster: WebSocket connection closed");
@@ -954,213 +826,12 @@ async fn send_json<T: Serialize>(socket: &mut WebSocket, msg: &T) -> Result<(), 
     let text = serde_json::to_string(msg).map_err(|e| {
         error!("CustomBroadcaster: Failed to serialize message: {}", e);
     })?;
-    socket.send(Message::Text(text.into())).await.map_err(|e| {
-        debug!("CustomBroadcaster: Failed to send message: {}", e);
-    })
-}
-
-/// Query all fields for a table with write-through caching
-/// - First request: performs full DB scan and caches results
-/// - Subsequent requests: serve directly from cache
-async fn query_all_fields_cached(
-    store: &Arc<AuthorityStore>,
-    table_id: ObjectID,
-    cache: &TableFieldsCache,
-    scan_in_progress: &ScanInProgress,
-) -> Result<Vec<FieldData>, anyhow::Error> {
-    // Fast path: check if already cached and ready
-    if let Some(entry) = cache.get(&table_id) {
-        if let (CacheStatus::Ready, fields) = entry.value() {
-            info!(
-                "query_all_fields_cached: serving {} fields from cache for table {}",
-                fields.len(),
-                table_id
-            );
-            return Ok(fields.values().cloned().collect());
-        }
-    }
-
-    // Check if a scan is already in progress for this table
-    if let Some(notify) = scan_in_progress.get(&table_id) {
-        let notify = notify.clone();
-        drop(notify); // Release the lock
-        info!(
-            "query_all_fields_cached: waiting for in-progress scan for table {}",
-            table_id
-        );
-        // Wait for the scan to complete (with timeout)
-        tokio::time::timeout(
-            std::time::Duration::from_secs(3600), // 1 hour timeout
-            async {
-                loop {
-                    if let Some(entry) = cache.get(&table_id) {
-                        if matches!(entry.value().0, CacheStatus::Ready) {
-                         // 2. Events Broadcast
-                         // If subscribe_all is true, we send all events.
-                         // In the future, we can add filter sets for events.
-                         if subscribe_all {
-                             for event in &outputs.events.data {
-                                 let msg = StreamMessage::Event {
-                                     package_id: event.package_id,
-                                     transaction_module: event.transaction_module.to_string(),
-                                     sender: event.sender,
-                                     type_: event.type_.to_string(),
-                                     contents: event.contents.clone(),
-                                     digest: digest.to_string(),
-                                 };
-                                 if let Err(_) = send_json(&mut socket, &msg).await { break; }
-                             }
-                         }
-
-                         // 3. Pool Updates (Written Objects)
-                         // We iterate through written objects to see if any match our subscribed pools
-                         for (id, object) in &outputs.written {
-                             if subscriptions_pools.contains(id) {
-                                  let object_bytes = object.data.try_as_move().map(|o| o.contents().to_vec());
-                                  let msg = StreamMessage::PoolUpdate {
-                                      pool_id: *id,
-                                      digest: digest.to_string(),
-                                      object: object_bytes,
-                                  };
-                                  if let Err(_) = send_json(&mut socket, &msg).await { break; }
-                             }
-                         }
-
-                         // 4. Account Updates (Sender)
-                         // Check if the sender is one of our subscribed accounts
-                         let sender = outputs.transaction.sender_address();
-                         if subscriptions_accounts.contains(&sender) {
-                             info!("CustomBroadcaster: Match found for Account {}", sender);
-                             let msg = StreamMessage::AccountActivity {
-                                 account: sender,
-                                 digest: digest.to_string(),
-                                 kind: "Transaction".to_string(),
-                             };
-                             if let Err(_) = send_json(&mut socket, &msg).await { break; }
-                         }
-
-                         // Note: Explicit BalanceChange extraction would require parsing the Move objects
-                         // in `outputs.written` to see if they are Coin<T> owned by `sender` and what their value is.
-                         // This is complex without a resolver. For now, AccountActivity gives the trigger.
-                    }
-                    Err(_) => break, // Channel closed
-                }
-            }
-
-            // Inbound: Handle subscriptions
-            res = socket.recv() => {
-                match res {
-                    Some(Ok(msg)) => {
-                        if let Message::Text(text) = msg {
-                            if let Ok(req) = serde_json::from_str::<SubscriptionRequest>(&text) {
-                                info!("Client subscribed: {:?}", req);
-                                match req {
-                                    SubscriptionRequest::SubscribePool(id) => {
-                                        subscriptions_pools.insert(id);
-                                    }
-                                    SubscriptionRequest::SubscribeAccount(addr) => {
-                                        info!("CustomBroadcaster: Client subscribed to Account {}", addr);
-                                        subscriptions_accounts.insert(addr);
-                                    }
-                                    SubscriptionRequest::SubscribeAll => {
-                                        subscribe_all = true;
-                                    }
-                                }
-                            }
-                        } else if let Message::Close(_) = msg {
-                            break;
-                        }
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-            },
-        )
+    socket
+        .send(Message::Text(text.into()))
         .await
-        .map_err(|_| anyhow::anyhow!("Timeout waiting for scan to complete"))?;
-
-        // Now the cache should be ready
-        if let Some(entry) = cache.get(&table_id) {
-            if let (CacheStatus::Ready, fields) = entry.value() {
-                return Ok(fields.values().cloned().collect());
-            }
-        }
-        return Err(anyhow::anyhow!("Cache not ready after waiting"));
-    }
-
-    // No cache and no scan in progress - start a new scan
-    let notify = Arc::new(tokio::sync::Notify::new());
-    scan_in_progress.insert(table_id, notify.clone());
-
-    // Mark as loading in cache
-    cache.insert(table_id, (CacheStatus::Loading, HashMap::new()));
-
-    info!(
-        "query_all_fields_cached: starting initial scan for table {}",
-        table_id
-    );
-
-    // Perform the scan in a blocking task
-    let store = store.clone();
-    let table_id_copy = table_id;
-    let cache_clone = cache.clone();
-    let scan_in_progress_clone = scan_in_progress.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        let mut fields_map: HashMap<ObjectID, FieldData> = HashMap::new();
-        let mut scanned = 0usize;
-        let mut matched = 0usize;
-
-        let iter = store.perpetual_tables.iter_live_object_set(false);
-
-        for live_obj in iter {
-            scanned += 1;
-
-            if scanned % 1_000_000 == 0 {
-                info!(
-                    "scan_all_fields: scanned {} objects so far, matched {}",
-                    scanned, matched
-                );
-            }
-
-            if let LiveObject::Normal(obj) = live_obj {
-                if let Owner::ObjectOwner(parent_addr) = obj.owner {
-                    if ObjectID::from(parent_addr) == table_id_copy {
-                        matched += 1;
-
-                        if let Some(move_obj) = obj.data.try_as_move() {
-                            let field_data = FieldData {
-                                field_id: obj.id(),
-                                object_bytes: move_obj.contents().to_vec(),
-                                object_type: move_obj.type_().to_string(),
-                            };
-                            fields_map.insert(obj.id(), field_data);
-                        }
-
-                        debug!("Matched dynamic field: field_id={}", obj.id());
-                    }
-                }
-            }
-        }
-
-        info!(
-            "scan_all_fields finished: scanned {} objects, found {} fields for table {}",
-            scanned, matched, table_id_copy
-        );
-
-        // Update cache with results
-        cache_clone.insert(table_id_copy, (CacheStatus::Ready, fields_map.clone()));
-
-        // Remove from scan_in_progress
-        scan_in_progress_clone.remove(&table_id_copy);
-
-        Ok::<Vec<FieldData>, anyhow::Error>(fields_map.into_values().collect())
-    })
-    .await??;
-
-    // Notify any waiters
-    notify.notify_waiters();
-
-    Ok(result)
+        .map_err(|e| {
+            debug!("CustomBroadcaster: Failed to send message: {}", e);
+        })
 }
 
 #[cfg(test)]
@@ -1169,6 +840,7 @@ mod tests {
 
     #[test]
     fn test_subscription_request_parsing() {
+        // Test subscribe_pool
         let json = r#"{"type":"subscribe_pool","pool_id":"0x1234"}"#;
         let req: SubscriptionRequest = serde_json::from_str(json).unwrap();
         match req {
@@ -1178,6 +850,7 @@ mod tests {
             _ => panic!("Expected SubscribePool"),
         }
 
+        // Test subscribe_account
         let json = r#"{"type":"subscribe_account","address":"0xabcd"}"#;
         let req: SubscriptionRequest = serde_json::from_str(json).unwrap();
         match req {
@@ -1187,6 +860,7 @@ mod tests {
             _ => panic!("Expected SubscribeAccount"),
         }
 
+        // Test subscribe_all
         let json = r#"{"type":"subscribe_all"}"#;
         let req: SubscriptionRequest = serde_json::from_str(json).unwrap();
         assert!(matches!(req, SubscriptionRequest::SubscribeAll));
@@ -1221,6 +895,7 @@ mod tests {
         let msg = StreamMessage::TxPoolState(payload);
         let json = serde_json::to_string(&msg).unwrap();
 
+        // Verify it can be parsed back
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["type"], "tx_pool_state");
         assert_eq!(parsed["updates"][0]["tick_index"], 12345);
@@ -1246,7 +921,7 @@ mod tests {
         let data: Vec<u8> = vec![0; 32];
         assert_eq!(try_read_u128(&data, 0), Some(0));
         assert_eq!(try_read_u128(&data, 16), Some(0));
-        assert_eq!(try_read_u128(&data, 17), None);
+        assert_eq!(try_read_u128(&data, 17), None); // Out of bounds
 
         let mut data = vec![0u8; 16];
         data[0] = 1;
@@ -1255,33 +930,10 @@ mod tests {
 
     #[test]
     fn test_try_read_i32() {
-        let data: Vec<u8> = vec![0xFF, 0xFF, 0xFF, 0xFF];
+        let data: Vec<u8> = vec![0xFF, 0xFF, 0xFF, 0xFF]; // -1 in little endian
         assert_eq!(try_read_i32(&data, 0), Some(-1));
 
-        let data: Vec<u8> = vec![0x01, 0x00, 0x00, 0x00];
+        let data: Vec<u8> = vec![0x01, 0x00, 0x00, 0x00]; // 1 in little endian
         assert_eq!(try_read_i32(&data, 0), Some(1));
-    }
-
-    #[test]
-    fn test_hex_decode_to_32_bytes() {
-        let result = hex_decode_to_32_bytes(
-            "0000000000000000000000000000000000000000000000000000000000001234",
-        );
-        assert_eq!(result[30], 0x12);
-        assert_eq!(result[31], 0x34);
-
-        let result = hex_decode_to_32_bytes("1234");
-        assert_eq!(result[30], 0x12);
-        assert_eq!(result[31], 0x34);
-        assert_eq!(result[0], 0x00);
-    }
-
-    #[test]
-    fn test_contains_subslice() {
-        assert!(contains_subslice(&[1, 2, 3, 4, 5], &[2, 3]));
-        assert!(contains_subslice(&[1, 2, 3, 4, 5], &[1]));
-        assert!(contains_subslice(&[1, 2, 3, 4, 5], &[5]));
-        assert!(!contains_subslice(&[1, 2, 3, 4, 5], &[6]));
-        assert!(!contains_subslice(&[1, 2], &[1, 2, 3]));
     }
 }
