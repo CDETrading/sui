@@ -10,7 +10,13 @@ use axum::{
 };
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::SystemTime};
+use std::{
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    sync::Arc,
+    time::SystemTime,
+};
+use sui_types::object::Owner;
 use sui_types::{
     base_types::{ObjectID, SuiAddress},
     object::Object,
@@ -23,24 +29,13 @@ use tracing::{debug, error, info, warn};
 
 /// Known CLMM pool package IDs (Cetus, etc.)
 /// These are the package addresses that contain pool::Pool types
-const KNOWN_POOL_MODULES: &[&str] = &[
-    "pool",
-    "clmm_pool",
-];
+const KNOWN_POOL_MODULES: &[&str] = &["pool", "clmm_pool"];
 
-const KNOWN_POOL_NAMES: &[&str] = &[
-    "Pool",
-];
+const KNOWN_POOL_NAMES: &[&str] = &["Pool"];
 
-const KNOWN_TICK_MODULES: &[&str] = &[
-    "tick",
-    "tick_manager",
-];
+const KNOWN_TICK_MODULES: &[&str] = &["tick", "tick_manager"];
 
-const KNOWN_TICK_NAMES: &[&str] = &[
-    "TickInfo",
-    "Tick",
-];
+const KNOWN_TICK_NAMES: &[&str] = &["TickInfo", "Tick"];
 
 // --- Subscription Request Types (JSON format matching user spec) ---
 
@@ -65,8 +60,13 @@ pub enum SubscriptionRequest {
     SubscribeAll,
 }
 
-// --- Stream Message Types ---
+#[derive(Clone, Debug, Serialize)]
+pub struct SerializableOutput {
+    pub digest: String,
+    pub timestamp_ms: u64,
+}
 
+// --- Stream Message Types ---
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type")]
 pub enum StreamMessage {
@@ -131,6 +131,10 @@ pub enum StreamMessage {
     /// Error message
     #[serde(rename = "error")]
     Error { message: String },
+
+    /// Raw output (for debugging)
+    #[serde(rename = "raw")]
+    Raw(SerializableOutput),
 }
 
 /// Payload for pool state updates
@@ -179,40 +183,34 @@ pub struct ExtractedPoolData {
 }
 
 /// Extracted tick data from BCS-encoded Move object
+/// Uses SuiAddress for parent_owner since Owner::ObjectOwner contains SuiAddress
 #[derive(Debug, Clone)]
 pub struct ExtractedTickData {
-    pub pool_id: ObjectID,  // Parent pool ID (from dynamic field)
+    pub parent_owner: SuiAddress,
     pub tick_index: i32,
     pub liquidity_gross: u128,
     pub liquidity_net: i128,
 }
 
+fn is_momentum_tickinfo(ty: &str) -> bool {
+    ty.ends_with("::tick::TickInfo")
+}
+
+fn is_cetus_tick(ty: &str) -> bool {
+    ty.ends_with("::tick::Tick")
+}
+
 /// Check if a type looks like a CLMM pool based on module/name patterns
 fn is_pool_type(module: &str, name: &str) -> bool {
-    KNOWN_POOL_MODULES.iter().any(|m| module.contains(m))
-        && KNOWN_POOL_NAMES.contains(&name)
+    KNOWN_POOL_MODULES.iter().any(|m| module.contains(m)) && KNOWN_POOL_NAMES.contains(&name)
 }
 
 /// Check if a type looks like a tick info based on module/name patterns
 fn is_tick_type(module: &str, name: &str) -> bool {
-    KNOWN_TICK_MODULES.iter().any(|m| module.contains(m))
-        && KNOWN_TICK_NAMES.contains(&name)
+    KNOWN_TICK_MODULES.iter().any(|m| module.contains(m)) && KNOWN_TICK_NAMES.contains(&name)
 }
 
 /// Try to extract pool data from a Move object
-///
-/// CLMM Pool struct typically has this layout (Cetus example):
-/// struct Pool<CoinTypeA, CoinTypeB> has key, store {
-///     id: UID,                          // 32 bytes
-///     coin_a: Balance<CoinTypeA>,       // 8 bytes (value only)
-///     coin_b: Balance<CoinTypeB>,       // 8 bytes (value only)
-///     tick_spacing: u32,                // 4 bytes
-///     fee_rate: u64,                    // 8 bytes
-///     liquidity: u128,                  // 16 bytes
-///     current_sqrt_price: u128,         // 16 bytes
-///     current_tick_index: I32,          // 4 bytes (signed)
-///     ...
-/// }
 fn try_extract_pool_data(object: &Object) -> Option<ExtractedPoolData> {
     let move_obj = object.data.try_as_move()?;
     let type_ = move_obj.type_();
@@ -227,8 +225,6 @@ fn try_extract_pool_data(object: &Object) -> Option<ExtractedPoolData> {
     let contents = move_obj.contents();
     let pool_id = object.id();
 
-    // Try to extract fields from the BCS bytes
-    // This is a best-effort extraction that works with common CLMM pool layouts
     if let Some((sqrt_price, tick_index, liquidity)) = try_parse_pool_fields(contents) {
         debug!(
             "Extracted pool data: pool_id={}, sqrt_price={}, tick_index={}, liquidity={}",
@@ -242,8 +238,6 @@ fn try_extract_pool_data(object: &Object) -> Option<ExtractedPoolData> {
         });
     }
 
-    // Fallback: return with placeholder values if we can identify it's a pool
-    // but can't parse the exact fields
     warn!(
         "Identified pool {} but couldn't parse fields (module={}, name={})",
         pool_id, module, name
@@ -254,39 +248,22 @@ fn try_extract_pool_data(object: &Object) -> Option<ExtractedPoolData> {
 /// Try to parse pool fields from BCS bytes
 /// Returns (sqrt_price, tick_index, liquidity) if successful
 fn try_parse_pool_fields(contents: &[u8]) -> Option<(u128, i32, u128)> {
-    // Minimum size check: UID (32) + at least some fields
     if contents.len() < 80 {
         return None;
     }
 
-    // Strategy: scan for patterns that look like sqrt_price (u128), tick_index (i32), liquidity (u128)
-    // Common offsets in CLMM pools vary, so we try multiple strategies
-
     // Strategy 1: Cetus-style layout
-    // After UID (32 bytes), there may be:
-    // - coin_a balance (8 bytes)
-    // - coin_b balance (8 bytes)
-    // - tick_spacing (4 bytes)
-    // - fee_rate (8 bytes)
-    // - liquidity (16 bytes) at offset 60
-    // - current_sqrt_price (16 bytes) at offset 76
-    // - current_tick_index (4 bytes) at offset 92
-
     if contents.len() >= 96 {
-        // Try Cetus-style offsets
         let liquidity = try_read_u128(contents, 60)?;
         let sqrt_price = try_read_u128(contents, 76)?;
         let tick_index = try_read_i32(contents, 92)?;
 
-        // Sanity checks for CLMM values
         if sqrt_price > 0 && liquidity < u128::MAX / 2 {
             return Some((sqrt_price, tick_index, liquidity));
         }
     }
 
     // Strategy 2: Alternative layout - search for sqrt_price pattern
-    // sqrt_price in Q64.64 format is typically between 2^32 and 2^192
-    // Look for consecutive u128 values that look reasonable
     for offset in (32..contents.len().saturating_sub(40)).step_by(8) {
         if let Some(sqrt_price) = try_read_u128(contents, offset)
             && sqrt_price >= (1u128 << 32)
@@ -312,6 +289,14 @@ fn try_read_u128(data: &[u8], offset: usize) -> Option<u128> {
     Some(u128::from_le_bytes(bytes))
 }
 
+fn try_read_i128_le(data: &[u8], offset: usize) -> Option<i128> {
+    if offset + 16 > data.len() {
+        return None;
+    }
+    let bytes: [u8; 16] = data[offset..offset + 16].try_into().ok()?;
+    Some(i128::from_le_bytes(bytes))
+}
+
 fn try_read_i32(data: &[u8], offset: usize) -> Option<i32> {
     if offset + 4 > data.len() {
         return None;
@@ -322,155 +307,249 @@ fn try_read_i32(data: &[u8], offset: usize) -> Option<i32> {
 
 /// Try to extract tick data from a dynamic field object
 fn try_extract_tick_data(object: &Object) -> Option<ExtractedTickData> {
+    // Get parent owner address - Owner::ObjectOwner contains SuiAddress
+    let parent_owner: SuiAddress = match object.owner() {
+        Owner::ObjectOwner(addr) => *addr,
+        _ => return None,
+    };
+
     let move_obj = object.data.try_as_move()?;
     let type_ = move_obj.type_();
-
     let module = type_.module().as_str();
     let name = type_.name().as_str();
 
-    // Check if this is a dynamic field containing tick info
-    // Dynamic fields have type: 0x2::dynamic_field::Field<K, V>
+    // Case A: dynamic_field::Field<...>
     if module == "dynamic_field" && name == "Field" {
-        // Try to parse the inner value type to see if it's a tick
         let type_str = type_.to_string();
         if type_str.contains("TickInfo") || type_str.contains("::tick::") {
-            return try_parse_tick_from_dynamic_field(object);
+            return try_parse_tick_from_dynamic_field(parent_owner, object);
         }
     }
 
-    // Direct tick object (less common)
-    if is_tick_type(module, name) {
-        return try_parse_direct_tick(object);
+    // Case B: Direct Tick / TickInfo
+    if is_tick_type(module, name)
+        || is_momentum_tickinfo(&type_.to_string())
+        || is_cetus_tick(&type_.to_string())
+    {
+        return try_parse_direct_tick(parent_owner, object);
     }
 
     None
 }
 
-fn try_parse_tick_from_dynamic_field(object: &Object) -> Option<ExtractedTickData> {
+fn try_parse_tick_from_dynamic_field(
+    parent_owner: SuiAddress,
+    object: &Object,
+) -> Option<ExtractedTickData> {
     let move_obj = object.data.try_as_move()?;
     let contents = move_obj.contents();
 
-    // Dynamic field layout:
-    // - UID (32 bytes)
-    // - name/key (variable, but for I32 tick index it's typically 4 bytes)
-    // - value (TickInfo struct)
-
-    if contents.len() < 56 {
+    // Minimum size: UID(32) + key(4) + liquidity_gross(16) + liquidity_net(16)
+    if contents.len() < 32 + 4 + 16 + 16 {
         return None;
     }
 
-    // Try to extract tick index from the key portion (after UID)
     let tick_index = try_read_i32(contents, 32)?;
 
-    // Try to find liquidity values in the remaining bytes
-    // TickInfo typically has: liquidity_gross (u128), liquidity_net (i128), ...
-    let offset = 36; // After UID + I32 key
-
-    if contents.len() >= offset + 32 {
-        let liquidity_gross = try_read_u128(contents, offset)?;
-        let liquidity_net_bytes = try_read_u128(contents, offset + 16)?;
-        let liquidity_net = liquidity_net_bytes as i128;
-
-        // Get parent ID from object reference or use object's own ID as placeholder
-        let pool_id = object.id();
-
-        return Some(ExtractedTickData {
-            pool_id,
-            tick_index,
-            liquidity_gross,
-            liquidity_net,
-        });
-    }
-
-    None
-}
-
-fn try_parse_direct_tick(object: &Object) -> Option<ExtractedTickData> {
-    let move_obj = object.data.try_as_move()?;
-    let contents = move_obj.contents();
-
-    if contents.len() < 48 {
-        return None;
-    }
-
-    // Direct TickInfo layout (after UID):
-    // - tick_index or other identifier
-    // - liquidity_gross (u128)
-    // - liquidity_net (i128)
-
-    let pool_id = object.id();
-    let tick_index = try_read_i32(contents, 32)?;
-    let liquidity_gross = try_read_u128(contents, 36)?;
-    let liquidity_net = try_read_u128(contents, 52)? as i128;
+    // value: TickInfo { liquidity_gross: u128, liquidity_net: i128, ... }
+    let value_offset = 36;
+    let liquidity_gross = try_read_u128(contents, value_offset)?;
+    let liquidity_net = try_read_i128_le(contents, value_offset + 16)?;
 
     Some(ExtractedTickData {
-        pool_id,
+        parent_owner,
         tick_index,
         liquidity_gross,
         liquidity_net,
     })
 }
 
+fn try_parse_direct_tick(parent_owner: SuiAddress, object: &Object) -> Option<ExtractedTickData> {
+    let move_obj = object.data.try_as_move()?;
+    let contents = move_obj.contents();
+
+    if contents.len() < 32 + 4 + 16 + 16 {
+        return None;
+    }
+
+    let tick_index = try_read_i32(contents, 32)?;
+    let liquidity_gross = try_read_u128(contents, 36)?;
+    let liquidity_net = try_read_i128_le(contents, 52)?;
+
+    Some(ExtractedTickData {
+        parent_owner,
+        tick_index,
+        liquidity_gross,
+        liquidity_net,
+    })
+}
+
+/// Convert SuiAddress to 32 bytes for pattern matching in pool contents
+fn sui_address_to_bytes(addr: &SuiAddress) -> [u8; 32] {
+    let s = addr.to_string();
+    let s = s.strip_prefix("0x").unwrap_or(&s);
+    hex_decode_to_32_bytes(s)
+}
+
+/// Manual hex decode without external crate - returns 32 bytes (zero-padded on left)
+fn hex_decode_to_32_bytes(hex_str: &str) -> [u8; 32] {
+    fn hex_val(c: u8) -> u8 {
+        match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            b'A'..=b'F' => c - b'A' + 10,
+            _ => 0,
+        }
+    }
+
+    let mut out = [0u8; 32];
+    let sb = hex_str.as_bytes();
+    let bytes_len = sb.len() / 2;
+    let start = 32usize.saturating_sub(bytes_len);
+
+    let mut i = 0usize;
+    let mut o = start;
+
+    while i + 1 < sb.len() && o < 32 {
+        let hi = hex_val(sb[i]);
+        let lo = hex_val(sb[i + 1]);
+        out[o] = (hi << 4) | lo;
+        i += 2;
+        o += 1;
+    }
+
+    out
+}
+
 /// Extract pool and tick changes from transaction outputs
-pub fn extract_pool_tick_changes(
-    outputs: &TransactionOutputs,
-) -> Option<TxPoolStatePayload> {
+pub fn extract_pool_tick_changes(outputs: &TransactionOutputs) -> Option<TxPoolStatePayload> {
     let tx_digest = outputs.transaction.digest().to_string();
     let ts_ms = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
+    // 1) Collect pool updates + pool BCS contents for owner->pool mapping
     let mut pool_updates: Vec<PoolStateUpdate> = Vec::new();
-    let mut tick_updates_by_pool: std::collections::HashMap<ObjectID, Vec<TickUpdate>> =
-        std::collections::HashMap::new();
+    let mut pool_contents_by_id: HashMap<ObjectID, Vec<u8>> = HashMap::new();
 
-    // First pass: extract all pool and tick data from written objects
+    // 2) Collect tick data
+    let mut extracted_ticks: Vec<ExtractedTickData> = Vec::new();
+    let mut tick_owner_candidates: HashSet<SuiAddress> = HashSet::new();
+
+    let mut pool_count = 0usize;
+    let mut tick_count = 0usize;
+
     for object in outputs.written.values() {
-        // Try to extract pool data
+        // Try pool extraction
         if let Some(pool_data) = try_extract_pool_data(object) {
+            pool_count += 1;
             pool_updates.push(PoolStateUpdate {
                 pool_id: pool_data.pool_id.to_string(),
                 sqrt_price: pool_data.sqrt_price.to_string(),
                 tick_index: pool_data.tick_index,
                 liquidity: pool_data.liquidity.to_string(),
-                ticks: Vec::new(), // Will be populated in second pass
+                ticks: Vec::new(),
             });
+
+            if let Some(m) = object.data.try_as_move() {
+                pool_contents_by_id.insert(pool_data.pool_id, m.contents().to_vec());
+            }
         }
 
-        // Try to extract tick data
-        if let Some(tick_data) = try_extract_tick_data(object) {
-            tick_updates_by_pool
-                .entry(tick_data.pool_id)
-                .or_default()
-                .push(TickUpdate {
-                    tick_index: tick_data.tick_index,
-                    liquidity_gross: tick_data.liquidity_gross.to_string(),
-                    liquidity_net: tick_data.liquidity_net.to_string(),
-                });
-        }
-    }
-
-    // Second pass: attach tick updates to their pools
-    for update in &mut pool_updates {
-        if let Ok(pool_id) = update.pool_id.parse::<ObjectID>()
-            && let Some(ticks) = tick_updates_by_pool.remove(&pool_id)
-        {
-            update.ticks = ticks;
+        // Try tick extraction
+        if let Some(tick) = try_extract_tick_data(object) {
+            tick_count += 1;
+            tick_owner_candidates.insert(tick.parent_owner);
+            extracted_ticks.push(tick);
         }
     }
 
-    // Return None if no pool updates found
+    debug!(
+        "extract_pool_tick_changes: found {} pools, {} ticks",
+        pool_count, tick_count
+    );
+
+    // If no pool updates, don't send
     if pool_updates.is_empty() {
         return None;
+    }
+
+    // 3) Build owner->pool mapping (best-effort)
+    let owner_to_pool = build_owner_to_pool_map(&pool_contents_by_id, &tick_owner_candidates);
+
+    let mapping_success = owner_to_pool.len();
+    let mapping_total = tick_owner_candidates.len();
+    debug!(
+        "owner->pool mapping: {}/{} successful",
+        mapping_success, mapping_total
+    );
+
+    // 4) Attach ticks to their pools
+    let mut tick_updates_by_pool: HashMap<ObjectID, Vec<TickUpdate>> = HashMap::new();
+
+    for t in extracted_ticks {
+        // Try to find the pool this tick belongs to
+        let pool_id_opt = owner_to_pool.get(&t.parent_owner).copied();
+
+        if let Some(pool_id) = pool_id_opt {
+            tick_updates_by_pool
+                .entry(pool_id)
+                .or_default()
+                .push(TickUpdate {
+                    tick_index: t.tick_index,
+                    liquidity_gross: t.liquidity_gross.to_string(),
+                    liquidity_net: t.liquidity_net.to_string(),
+                });
+        }
+        // If no mapping found, we skip this tick (can't reliably attribute it)
+    }
+
+    for update in &mut pool_updates {
+        if let Ok(pool_id) = update.pool_id.parse::<ObjectID>() {
+            if let Some(ticks) = tick_updates_by_pool.remove(&pool_id) {
+                update.ticks = ticks;
+            }
+        }
     }
 
     Some(TxPoolStatePayload {
         ts_ms,
         tx_digest,
-        checkpoint_seq: None, // Not available before commit
+        checkpoint_seq: None,
         updates: pool_updates,
     })
+}
+
+/// Build best-effort owner->pool mapping:
+/// If tick entry's owner (usually table object) bytes are found in pool contents,
+/// we assume that table belongs to that pool.
+fn build_owner_to_pool_map(
+    pool_contents_by_id: &HashMap<ObjectID, Vec<u8>>,
+    candidate_owners: &HashSet<SuiAddress>,
+) -> HashMap<SuiAddress, ObjectID> {
+    let mut map = HashMap::new();
+
+    for owner_addr in candidate_owners {
+        let needle = sui_address_to_bytes(owner_addr);
+
+        // Find first pool that contains this address bytes
+        for (pool_id, contents) in pool_contents_by_id {
+            if contains_subslice(contents, &needle) {
+                map.insert(*owner_addr, *pool_id);
+                break;
+            }
+        }
+    }
+
+    map
+}
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 // --- Broadcaster State ---
@@ -505,22 +584,13 @@ pub struct CustomBroadcaster;
 
 impl CustomBroadcaster {
     pub fn spawn(mut rx: mpsc::Receiver<Arc<TransactionOutputs>>, port: u16) {
-        // Create a broadcast channel for all connected websocket clients
-        // Capacity 10000 to handle bursts without blocking
         let (tx, _) = broadcast::channel(10000);
         let tx_clone = tx.clone();
 
-        // Create the write-through cache for table fields
-        let fields_cache: TableFieldsCache = Arc::new(DashMap::new());
-        let fields_cache_clone = fields_cache.clone();
-        let scan_in_progress: ScanInProgress = Arc::new(DashMap::new());
-
-        // Spawn the ingestion loop with cache updates
+        // Spawn the ingestion loop
         tokio::spawn(async move {
             info!("CustomBroadcaster: Ingestion loop started with write-through cache");
             while let Some(outputs) = rx.recv().await {
-                // Broadcast the Arc directly to avoid cloning the heavy data structure
-                // Serialization happens in the client handling task
                 if let Err(e) = tx_clone.send(outputs) {
                     debug!(
                         "CustomBroadcaster: No active subscribers, dropped message: {}",
@@ -532,12 +602,7 @@ impl CustomBroadcaster {
         });
 
         // Spawn the WebServer
-        let app_state = Arc::new(AppState {
-            tx,
-            store: authority_store,
-            fields_cache,
-            scan_in_progress,
-        });
+        let app_state = Arc::new(AppState { tx });
 
         tokio::spawn(async move {
             let app = Router::new()
@@ -649,7 +714,6 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
 
     loop {
         tokio::select! {
-            // Outbound: Send updates to client
             res = rx.recv() => {
                 match res {
                     Ok(outputs) => {
@@ -663,7 +727,6 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
 
                         // 1. Try to extract and send pool state updates
                         if let Some(pool_payload) = extract_pool_tick_changes(&outputs) {
-                            // Check if any pool in the update matches our subscriptions
                             let should_send = subscribe_all || pool_payload.updates.iter().any(|u| {
                                 u.pool_id.parse::<ObjectID>()
                                     .map(|id| subscriptions_pools.contains(&id))
@@ -704,7 +767,6 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                 break;
                             }
 
-                            // Send all events
                             for event in &outputs.events.data {
                                 let msg = StreamMessage::Event {
                                     package_id: event.package_id.to_string(),
@@ -735,7 +797,6 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         warn!("CustomBroadcaster: Client lagged, skipped {} messages", n);
-                        // Continue processing, don't disconnect
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         info!("CustomBroadcaster: Broadcast channel closed");
@@ -744,7 +805,6 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 }
             }
 
-            // Inbound: Handle subscriptions
             res = socket.recv() => {
                 match res {
                     Some(Ok(msg)) => {
@@ -800,7 +860,6 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                 break;
                             }
                             Message::Ping(data) => {
-                                // Respond to ping with pong
                                 let _ = socket.send(Message::Pong(data)).await;
                             }
                             _ => {}
@@ -826,12 +885,9 @@ async fn send_json<T: Serialize>(socket: &mut WebSocket, msg: &T) -> Result<(), 
     let text = serde_json::to_string(msg).map_err(|e| {
         error!("CustomBroadcaster: Failed to serialize message: {}", e);
     })?;
-    socket
-        .send(Message::Text(text.into()))
-        .await
-        .map_err(|e| {
-            debug!("CustomBroadcaster: Failed to send message: {}", e);
-        })
+    socket.send(Message::Text(text.into())).await.map_err(|e| {
+        debug!("CustomBroadcaster: Failed to send message: {}", e);
+    })
 }
 
 #[cfg(test)]
@@ -840,7 +896,6 @@ mod tests {
 
     #[test]
     fn test_subscription_request_parsing() {
-        // Test subscribe_pool
         let json = r#"{"type":"subscribe_pool","pool_id":"0x1234"}"#;
         let req: SubscriptionRequest = serde_json::from_str(json).unwrap();
         match req {
@@ -850,7 +905,6 @@ mod tests {
             _ => panic!("Expected SubscribePool"),
         }
 
-        // Test subscribe_account
         let json = r#"{"type":"subscribe_account","address":"0xabcd"}"#;
         let req: SubscriptionRequest = serde_json::from_str(json).unwrap();
         match req {
@@ -860,7 +914,6 @@ mod tests {
             _ => panic!("Expected SubscribeAccount"),
         }
 
-        // Test subscribe_all
         let json = r#"{"type":"subscribe_all"}"#;
         let req: SubscriptionRequest = serde_json::from_str(json).unwrap();
         assert!(matches!(req, SubscriptionRequest::SubscribeAll));
@@ -895,7 +948,6 @@ mod tests {
         let msg = StreamMessage::TxPoolState(payload);
         let json = serde_json::to_string(&msg).unwrap();
 
-        // Verify it can be parsed back
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["type"], "tx_pool_state");
         assert_eq!(parsed["updates"][0]["tick_index"], 12345);
@@ -921,7 +973,7 @@ mod tests {
         let data: Vec<u8> = vec![0; 32];
         assert_eq!(try_read_u128(&data, 0), Some(0));
         assert_eq!(try_read_u128(&data, 16), Some(0));
-        assert_eq!(try_read_u128(&data, 17), None); // Out of bounds
+        assert_eq!(try_read_u128(&data, 17), None);
 
         let mut data = vec![0u8; 16];
         data[0] = 1;
@@ -930,10 +982,31 @@ mod tests {
 
     #[test]
     fn test_try_read_i32() {
-        let data: Vec<u8> = vec![0xFF, 0xFF, 0xFF, 0xFF]; // -1 in little endian
+        let data: Vec<u8> = vec![0xFF, 0xFF, 0xFF, 0xFF];
         assert_eq!(try_read_i32(&data, 0), Some(-1));
 
-        let data: Vec<u8> = vec![0x01, 0x00, 0x00, 0x00]; // 1 in little endian
+        let data: Vec<u8> = vec![0x01, 0x00, 0x00, 0x00];
         assert_eq!(try_read_i32(&data, 0), Some(1));
+    }
+
+    #[test]
+    fn test_hex_decode_to_32_bytes() {
+        let result = hex_decode_to_32_bytes("0000000000000000000000000000000000000000000000000000000000001234");
+        assert_eq!(result[30], 0x12);
+        assert_eq!(result[31], 0x34);
+
+        let result = hex_decode_to_32_bytes("1234");
+        assert_eq!(result[30], 0x12);
+        assert_eq!(result[31], 0x34);
+        assert_eq!(result[0], 0x00);
+    }
+
+    #[test]
+    fn test_contains_subslice() {
+        assert!(contains_subslice(&[1, 2, 3, 4, 5], &[2, 3]));
+        assert!(contains_subslice(&[1, 2, 3, 4, 5], &[1]));
+        assert!(contains_subslice(&[1, 2, 3, 4, 5], &[5]));
+        assert!(!contains_subslice(&[1, 2, 3, 4, 5], &[6]));
+        assert!(!contains_subslice(&[1, 2], &[1, 2, 3]));
     }
 }
