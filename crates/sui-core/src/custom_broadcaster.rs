@@ -72,6 +72,13 @@ pub enum StreamMessage {
         object: Option<Vec<u8>>,
     },
 
+    FieldUpdate {
+        pool_id: ObjectID,  // Parent table ID
+        field_id: ObjectID, // Field object ID
+        digest: String,
+        object: Option<Vec<u8>>, // Field<K,V> 的序列化資料
+    },
+
     /// Account activity notification
     #[serde(rename = "account_activity")]
     AccountActivity {
@@ -594,168 +601,182 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
 
     loop {
         tokio::select! {
-            res = rx.recv() => {
-                match res {
-                    Ok(outputs) => {
-                        let digest = outputs.transaction.digest();
-                        let sender = outputs.transaction.sender_address();
+                    res = rx.recv() => {
+                        match res {
+                            Ok(outputs) => {
+                                let digest = outputs.transaction.digest();
+                                let sender = outputs.transaction.sender_address();
 
-                        debug!(
-                            "CustomBroadcaster: Processing Tx {} from Sender {} (AccSubs: {}, PoolSubs: {})",
-                            digest, sender, subscriptions_accounts.len(), subscriptions_pools.len()
-                        );
+                                debug!(
+                                    "CustomBroadcaster: Processing Tx {} from Sender {} (AccSubs: {}, PoolSubs: {})",
+                                    digest, sender, subscriptions_accounts.len(), subscriptions_pools.len()
+                                );
 
-                        // 1. Try to extract and send pool state updates
-                        if let Some(pool_payload) = extract_pool_tick_changes(&outputs) {
-                            let should_send = subscribe_all || pool_payload.updates.iter().any(|u| {
-                                u.pool_id.parse::<ObjectID>()
-                                    .map(|id| subscriptions_pools.contains(&id))
-                                    .unwrap_or(false)
-                            });
+                                // 1. Try to extract and send pool state updates
+                                if let Some(pool_payload) = extract_pool_tick_changes(&outputs) {
+                                    let should_send = subscribe_all || pool_payload.updates.iter().any(|u| {
+                                        u.pool_id.parse::<ObjectID>()
+                                            .map(|id| subscriptions_pools.contains(&id))
+                                            .unwrap_or(false)
+                                    });
 
-                            if should_send {
-                                let msg = StreamMessage::TxPoolState(pool_payload);
-                                if send_json(&mut socket, &msg).await.is_err() {
-                                    break;
-                                }
-                            }
-                        }
-
-                        // 2. Send legacy pool updates for subscribed pools (raw bytes)
-                        for (id, object) in &outputs.written {
-                            if subscriptions_pools.contains(id) {
-                                let object_bytes = object.data.try_as_move().map(|o| o.contents().to_vec());
-                                let msg = StreamMessage::PoolUpdate {
-                                    pool_id: id.to_string(),
-                                    digest: digest.to_string(),
-                                    object: object_bytes,
-                                };
-                                if send_json(&mut socket, &msg).await.is_err() {
-                                    break;
-                                }
-                            }
-                        }
-
-                        // 3. Account activity for subscribe_all
-                        if subscribe_all {
-                            let msg = StreamMessage::AccountActivity {
-                                account: sender.to_string(),
-                                digest: digest.to_string(),
-                                kind: "Transaction".to_string(),
-                            };
-                            if send_json(&mut socket, &msg).await.is_err() {
-                                break;
-                            }
-
-                            for event in &outputs.events.data {
-                                let msg = StreamMessage::Event {
-                                    package_id: event.package_id.to_string(),
-                                    transaction_module: event.transaction_module.to_string(),
-                                    sender: event.sender.to_string(),
-                                    type_: event.type_.to_string(),
-                                    contents: event.contents.clone(),
-                                    digest: digest.to_string(),
-                                };
-                                if send_json(&mut socket, &msg).await.is_err() {
-                                    break;
-                                }
-                            }
-                        }
-
-                        // 4. Account activity for subscribed accounts
-                        if subscriptions_accounts.contains(&sender) {
-                            info!("CustomBroadcaster: Match found for Account {}", sender);
-                            let msg = StreamMessage::AccountActivity {
-                                account: sender.to_string(),
-                                digest: digest.to_string(),
-                                kind: "Transaction".to_string(),
-                            };
-                            if send_json(&mut socket, &msg).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("CustomBroadcaster: Client lagged, skipped {} messages", n);
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        info!("CustomBroadcaster: Broadcast channel closed");
-                        break;
-                    }
-                }
-            }
-
-            res = socket.recv() => {
-                match res {
-                    Some(Ok(msg)) => {
-                        match msg {
-                            Message::Text(text) => {
-                                match serde_json::from_str::<SubscriptionRequest>(&text) {
-                                    Ok(req) => {
-                                        match req {
-                                            SubscriptionRequest::SubscribePool { pool_id } => {
-                                                match pool_id.parse::<ObjectID>() {
-                                                    Ok(id) => {
-                                                        info!("CustomBroadcaster: Client subscribed to Pool {}", id);
-                                                        subscriptions_pools.insert(id);
-                                                    }
-                                                    Err(_) => {
-                                                        let err_msg = StreamMessage::Error {
-                                                            message: format!("Invalid pool_id: {}", pool_id),
-                                                        };
-                                                        let _ = send_json(&mut socket, &err_msg).await;
-                                                    }
-                                                }
-                                            }
-                                            SubscriptionRequest::SubscribeAccount { address } => {
-                                                match address.parse::<SuiAddress>() {
-                                                    Ok(addr) => {
-                                                        info!("CustomBroadcaster: Client subscribed to Account {}", addr);
-                                                        subscriptions_accounts.insert(addr);
-                                                    }
-                                                    Err(_) => {
-                                                        let err_msg = StreamMessage::Error {
-                                                            message: format!("Invalid address: {}", address),
-                                                        };
-                                                        let _ = send_json(&mut socket, &err_msg).await;
-                                                    }
-                                                }
-                                            }
-                                            SubscriptionRequest::SubscribeAll => {
-                                                info!("CustomBroadcaster: Client subscribed to all updates");
-                                                subscribe_all = true;
-                                            }
+                                    if should_send {
+                                        let msg = StreamMessage::TxPoolState(pool_payload);
+                                        if send_json(&mut socket, &msg).await.is_err() {
+                                            break;
                                         }
                                     }
-                                    Err(e) => {
-                                        let err_msg = StreamMessage::Error {
-                                            message: format!("Invalid subscription request: {}", e),
-                                        };
-                                        let _ = send_json(&mut socket, &err_msg).await;
-                                    }
                                 }
-                            }
-                            Message::Close(_) => {
-                                info!("CustomBroadcaster: Client sent close frame");
-                                break;
-                            }
-                            Message::Ping(data) => {
-                                let _ = socket.send(Message::Pong(data)).await;
-                            }
-                            _ => {}
-                        }
-                    }
-                    Some(Err(e)) => {
-                        warn!("CustomBroadcaster: WebSocket error: {}", e);
-                        break;
-                    }
-                    None => {
-                        info!("CustomBroadcaster: WebSocket stream ended");
-                        break;
-                    }
+
+                                // 2. Send legacy pool updates for subscribed pools (raw bytes)
+        for (id, object) in &outputs.written {
+            // 情況 1: 物件本身是訂閱的 pool/table
+            if subscriptions_pools.contains(id) {
+                let object_bytes = object.data.try_as_move().map(|o| o.contents().to_vec());
+                let msg = StreamMessage::PoolUpdate {
+                    pool_id: id.to_string(),
+                    digest: digest.to_string(),
+                    object: object_bytes,
+                };
+                if let Err(_) = send_json(&mut socket, &msg).await { break; }
+            }
+
+            // 情況 2: 物件是訂閱 pool/table 的 child object (dynamic field)
+            if let sui_types::object::Owner::ObjectOwner(parent_addr) = &object.owner {
+                let parent_id = ObjectID::from(*parent_addr);
+                if subscriptions_pools.contains(&parent_id) {
+                    let object_bytes = object.data.try_as_move().map(|o| o.contents().to_vec());
+                    let msg = StreamMessage::FieldUpdate {
+                        pool_id: parent_id,
+                        field_id: *id,
+                        digest: digest.to_string(),
+                        object: object_bytes,
+                    };
+                    if let Err(_) = send_json(&mut socket, &msg).await { break; }
                 }
             }
         }
+
+                                // 3. Account activity for subscribe_all
+                                if subscribe_all {
+                                    let msg = StreamMessage::AccountActivity {
+                                        account: sender.to_string(),
+                                        digest: digest.to_string(),
+                                        kind: "Transaction".to_string(),
+                                    };
+                                    if send_json(&mut socket, &msg).await.is_err() {
+                                        break;
+                                    }
+
+                                    for event in &outputs.events.data {
+                                        let msg = StreamMessage::Event {
+                                            package_id: event.package_id.to_string(),
+                                            transaction_module: event.transaction_module.to_string(),
+                                            sender: event.sender.to_string(),
+                                            type_: event.type_.to_string(),
+                                            contents: event.contents.clone(),
+                                            digest: digest.to_string(),
+                                        };
+                                        if send_json(&mut socket, &msg).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                // 4. Account activity for subscribed accounts
+                                if subscriptions_accounts.contains(&sender) {
+                                    info!("CustomBroadcaster: Match found for Account {}", sender);
+                                    let msg = StreamMessage::AccountActivity {
+                                        account: sender.to_string(),
+                                        digest: digest.to_string(),
+                                        kind: "Transaction".to_string(),
+                                    };
+                                    if send_json(&mut socket, &msg).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                warn!("CustomBroadcaster: Client lagged, skipped {} messages", n);
+                            }
+                            Err(broadcast::error::RecvError::Closed) => {
+                                info!("CustomBroadcaster: Broadcast channel closed");
+                                break;
+                            }
+                        }
+                    }
+
+                    res = socket.recv() => {
+                        match res {
+                            Some(Ok(msg)) => {
+                                match msg {
+                                    Message::Text(text) => {
+                                        match serde_json::from_str::<SubscriptionRequest>(&text) {
+                                            Ok(req) => {
+                                                match req {
+                                                    SubscriptionRequest::SubscribePool { pool_id } => {
+                                                        match pool_id.parse::<ObjectID>() {
+                                                            Ok(id) => {
+                                                                info!("CustomBroadcaster: Client subscribed to Pool {}", id);
+                                                                subscriptions_pools.insert(id);
+                                                            }
+                                                            Err(_) => {
+                                                                let err_msg = StreamMessage::Error {
+                                                                    message: format!("Invalid pool_id: {}", pool_id),
+                                                                };
+                                                                let _ = send_json(&mut socket, &err_msg).await;
+                                                            }
+                                                        }
+                                                    }
+                                                    SubscriptionRequest::SubscribeAccount { address } => {
+                                                        match address.parse::<SuiAddress>() {
+                                                            Ok(addr) => {
+                                                                info!("CustomBroadcaster: Client subscribed to Account {}", addr);
+                                                                subscriptions_accounts.insert(addr);
+                                                            }
+                                                            Err(_) => {
+                                                                let err_msg = StreamMessage::Error {
+                                                                    message: format!("Invalid address: {}", address),
+                                                                };
+                                                                let _ = send_json(&mut socket, &err_msg).await;
+                                                            }
+                                                        }
+                                                    }
+                                                    SubscriptionRequest::SubscribeAll => {
+                                                        info!("CustomBroadcaster: Client subscribed to all updates");
+                                                        subscribe_all = true;
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                let err_msg = StreamMessage::Error {
+                                                    message: format!("Invalid subscription request: {}", e),
+                                                };
+                                                let _ = send_json(&mut socket, &err_msg).await;
+                                            }
+                                        }
+                                    }
+                                    Message::Close(_) => {
+                                        info!("CustomBroadcaster: Client sent close frame");
+                                        break;
+                                    }
+                                    Message::Ping(data) => {
+                                        let _ = socket.send(Message::Pong(data)).await;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            Some(Err(e)) => {
+                                warn!("CustomBroadcaster: WebSocket error: {}", e);
+                                break;
+                            }
+                            None => {
+                                info!("CustomBroadcaster: WebSocket stream ended");
+                                break;
+                            }
+                        }
+                    }
+                }
     }
 
     info!("CustomBroadcaster: WebSocket connection closed");
@@ -871,7 +892,9 @@ mod tests {
 
     #[test]
     fn test_hex_decode_to_32_bytes() {
-        let result = hex_decode_to_32_bytes("0000000000000000000000000000000000000000000000000000000000001234");
+        let result = hex_decode_to_32_bytes(
+            "0000000000000000000000000000000000000000000000000000000000001234",
+        );
         assert_eq!(result[30], 0x12);
         assert_eq!(result[31], 0x34);
 
