@@ -980,6 +980,220 @@ mod tests {
     }
 
     #[sim_test]
+    async fn test_verify_immutable_object_claims() {
+        let (sender, _keypair) = deterministic_random_account_key();
+
+        // Create owned objects
+        let owned_object1 = Object::with_id_owner_for_testing(ObjectID::random(), sender);
+        let owned_object2 = Object::with_id_owner_for_testing(ObjectID::random(), sender);
+
+        // Create immutable objects
+        let immutable_object1 = Object::immutable_with_id_for_testing(ObjectID::random());
+        let immutable_object2 = Object::immutable_with_id_for_testing(ObjectID::random());
+
+        // Save IDs before moving objects
+        let owned_id1 = owned_object1.id();
+        let owned_id2 = owned_object2.id();
+        let immutable_id1 = immutable_object1.id();
+        let immutable_id2 = immutable_object2.id();
+
+        let all_objects = vec![
+            owned_object1,
+            owned_object2,
+            immutable_object1,
+            immutable_object2,
+        ];
+
+        let network_config =
+            sui_swarm_config::network_config_builder::ConfigBuilder::new_with_temp_dir()
+                .committee_size(NonZeroUsize::new(1).unwrap())
+                .with_objects(all_objects)
+                .build();
+
+        let state = TestAuthorityBuilder::new()
+            .with_network_config(&network_config, 0)
+            .build()
+            .await;
+
+        // Retrieve actual object references from the state (as they are after genesis)
+        let cache_reader = state.get_object_cache_reader();
+        let owned_ref1 = cache_reader
+            .get_object(&owned_id1)
+            .expect("owned_id1 not found")
+            .compute_object_reference();
+        let owned_ref2 = cache_reader
+            .get_object(&owned_id2)
+            .expect("owned_id2 not found")
+            .compute_object_reference();
+        let immutable_ref1 = cache_reader
+            .get_object(&immutable_id1)
+            .expect("immutable_id1 not found")
+            .compute_object_reference();
+        let immutable_ref2 = cache_reader
+            .get_object(&immutable_id2)
+            .expect("immutable_id2 not found")
+            .compute_object_reference();
+
+        let validator = SuiTxValidator::new(
+            state.clone(),
+            state.epoch_store_for_testing().clone(),
+            Arc::new(CheckpointServiceNoop {}),
+            SuiTxValidatorMetrics::new(&Default::default()),
+        );
+
+        // Test 1: Empty claims with no immutable objects in inputs - should pass
+        {
+            let owned_refs: HashSet<ObjectRef> = [owned_ref1, owned_ref2].into_iter().collect();
+
+            let result = validator.verify_immutable_object_claims(&[], owned_refs);
+            assert!(
+                result.is_ok(),
+                "Empty claims with only owned objects should pass, got error: {:?}",
+                result.err()
+            );
+        }
+
+        // Test 2: Correct claims - immutable objects properly claimed - should pass
+        {
+            let refs: HashSet<ObjectRef> = [owned_ref1, immutable_ref1].into_iter().collect();
+
+            let claimed_ids = vec![immutable_id1];
+            let result = validator.verify_immutable_object_claims(&claimed_ids, refs);
+            assert!(result.is_ok(), "Correct immutable object claim should pass");
+        }
+
+        // Test 3: Multiple correct claims - should pass
+        {
+            let refs: HashSet<ObjectRef> = [owned_ref1, immutable_ref1, immutable_ref2]
+                .into_iter()
+                .collect();
+
+            let claimed_ids = vec![immutable_id1, immutable_id2];
+            let result = validator.verify_immutable_object_claims(&claimed_ids, refs);
+            assert!(
+                result.is_ok(),
+                "Multiple correct immutable claims should pass"
+            );
+        }
+
+        // Test 4: Missing claim - immutable object not claimed - should fail
+        {
+            let refs: HashSet<ObjectRef> = [owned_ref1, immutable_ref1].into_iter().collect();
+
+            let claimed_ids: Vec<ObjectID> = vec![];
+            let result = validator.verify_immutable_object_claims(&claimed_ids, refs);
+            assert!(result.is_err(), "Missing immutable claim should fail");
+
+            let err = result.unwrap_err();
+            assert!(
+                matches!(
+                    err.as_inner(),
+                    SuiErrorKind::ImmutableObjectNotClaimed { object_id }
+                    if *object_id == immutable_id1
+                ),
+                "Expected ImmutableObjectNotClaimed error, got: {:?}",
+                err.as_inner()
+            );
+        }
+
+        // Test 5: False claim - owned object claimed as immutable - should fail
+        {
+            let refs: HashSet<ObjectRef> = [owned_ref1, owned_ref2].into_iter().collect();
+
+            let claimed_ids = vec![owned_id1];
+            let result = validator.verify_immutable_object_claims(&claimed_ids, refs);
+            assert!(
+                result.is_err(),
+                "False immutable claim on owned object should fail"
+            );
+
+            let err = result.unwrap_err();
+            assert!(
+                matches!(
+                    err.as_inner(),
+                    SuiErrorKind::InvalidImmutableObjectClaim { claimed_object_id, .. }
+                    if *claimed_object_id == owned_id1
+                ),
+                "Expected InvalidImmutableObjectClaim error, got: {:?}",
+                err.as_inner()
+            );
+        }
+
+        // Test 6: Claim not in inputs - should fail
+        {
+            let refs: HashSet<ObjectRef> = [owned_ref1, owned_ref2].into_iter().collect();
+
+            let claimed_ids = vec![immutable_id1];
+            let result = validator.verify_immutable_object_claims(&claimed_ids, refs);
+            assert!(result.is_err(), "Claim not in inputs should fail");
+
+            let err = result.unwrap_err();
+            assert!(
+                matches!(
+                    err.as_inner(),
+                    SuiErrorKind::ImmutableObjectClaimNotFoundInInput { object_id }
+                    if *object_id == immutable_id1
+                ),
+                "Expected ImmutableObjectClaimNotFoundInInput error, got: {:?}",
+                err.as_inner()
+            );
+        }
+
+        // Test 7: Object not found (non-existent object) - should fail
+        {
+            let non_existent_id = ObjectID::random();
+            let fake_ref = (
+                non_existent_id,
+                sui_types::base_types::SequenceNumber::new(),
+                sui_types::digests::ObjectDigest::random(),
+            );
+            let refs: HashSet<ObjectRef> = [owned_ref1, fake_ref].into_iter().collect();
+
+            let claimed_ids: Vec<ObjectID> = vec![];
+            let result = validator.verify_immutable_object_claims(&claimed_ids, refs);
+            assert!(result.is_err(), "Non-existent object should fail");
+
+            let err = result.unwrap_err();
+            assert!(
+                matches!(
+                    err.as_inner(),
+                    SuiErrorKind::UserInputError { error: UserInputError::ObjectNotFound { object_id, .. } }
+                    if *object_id == non_existent_id
+                ),
+                "Expected ObjectNotFound error, got: {:?}",
+                err.as_inner()
+            );
+        }
+
+        // Test 8: Version/digest mismatch for immutable object - should fail
+        {
+            // Use a wrong version for the immutable object
+            let wrong_version_ref = (
+                immutable_ref1.0,
+                sui_types::base_types::SequenceNumber::from_u64(999),
+                immutable_ref1.2,
+            );
+
+            let refs: HashSet<ObjectRef> = [owned_ref1, wrong_version_ref].into_iter().collect();
+
+            let claimed_ids = vec![immutable_id1];
+            let result = validator.verify_immutable_object_claims(&claimed_ids, refs);
+            assert!(result.is_err(), "Version mismatch should fail");
+
+            let err = result.unwrap_err();
+            assert!(
+                matches!(
+                    err.as_inner(),
+                    SuiErrorKind::UserInputError { error: UserInputError::ObjectVersionUnavailableForConsumption { provided_obj_ref, current_version: _ } }
+                    if provided_obj_ref.0 == immutable_id1
+                ),
+                "Expected ObjectVersionUnavailableForConsumption error, got: {:?}",
+                err.as_inner()
+            );
+        }
+    }
+
+    #[sim_test]
     async fn accept_already_executed_transaction() {
         // This test uses ConsensusTransaction::new_user_transaction_message which creates a
         // UserTransaction. When disable_preconsensus_locking=true (protocol version 105+),
