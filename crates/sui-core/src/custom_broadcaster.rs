@@ -866,35 +866,54 @@ async fn scan_all_fields(
     let store = store.clone();
     let table_id_copy = table_id;
     
-    tokio::task::spawn_blocking(move || {
-        let mut fields = Vec::new();
-        
-        // 遍歷所有存活的物件
-        let iter = store.perpetual_tables.iter_live_object_set(false);
-        
-        for live_obj in iter {
-            // 只處理正常物件（非 wrapped）
-            if let LiveObject::Normal(obj) = live_obj {
-                // 檢查 owner 是否為我們的 table
-                if let Owner::ObjectOwner(parent_addr) = obj.owner {
-                    if ObjectID::from(parent_addr) == table_id_copy {
-                        // 這是我們要的 dynamic field
-                        if let Some(move_obj) = obj.data.try_as_move() {
-                            fields.push(FieldData {
-                                field_id: obj.id(),
-                                object_bytes: move_obj.contents().to_vec(),
-                                object_type: move_obj.type_().to_string(),
-                            });
-                        }
+tokio::task::spawn_blocking(move || {
+    let mut fields = Vec::new();
+    let mut scanned = 0usize;
+    let mut matched = 0usize;
+
+    let iter = store.perpetual_tables.iter_live_object_set(false);
+
+    for live_obj in iter {
+        scanned += 1;
+
+        if scanned % 100 == 0 {
+            info!(
+                "scan_all_fields: scanned {} objects so far, matched {}",
+                scanned, matched
+            );
+        }
+
+        if let LiveObject::Normal(obj) = live_obj {
+            if let Owner::ObjectOwner(parent_addr) = obj.owner {
+                if ObjectID::from(parent_addr) == table_id_copy {
+                    matched += 1;
+
+                    if let Some(move_obj) = obj.data.try_as_move() {
+                        fields.push(FieldData {
+                            field_id: obj.id(),
+                            object_bytes: move_obj.contents().to_vec(),
+                            object_type: move_obj.type_().to_string(),
+                        });
                     }
+
+                    // 命中 table 時印一次（重要）
+                    debug!(
+                        "Matched dynamic field: field_id={}",
+                        obj.id()
+                    );
                 }
             }
         }
-        
-        info!("Found {} fields for table {}", fields.len(), table_id_copy);
-        Ok(fields)
-    })
-    .await?
+    }
+
+    info!(
+        "scan_all_fields finished: scanned {} objects, found {} fields for table {}",
+        scanned, matched, table_id_copy
+    );
+
+    Ok(fields)
+})
+.await?
 }
 #[cfg(test)]
 mod tests {
