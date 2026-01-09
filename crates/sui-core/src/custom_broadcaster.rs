@@ -61,7 +61,7 @@ pub enum SubscriptionRequest {
     SubscribeAll,
 
     #[serde(rename = "query_all_fields")]
-    QueryAllFields(ObjectID),
+    QueryAllFields { table_id: ObjectID },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -901,7 +901,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                                                 subscribe_all = true;
                                                             }
 
-                                                            SubscriptionRequest::QueryAllFields(table_id) => {
+                                                            SubscriptionRequest::QueryAllFields { table_id } => {
                                                                 info!("Client querying all fields for table: {}", table_id);
                                                                 
                                                                 // 執行掃描並直接發送（不要 clone socket）
