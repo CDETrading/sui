@@ -20,11 +20,12 @@ use sui_types::object::Owner;
 use sui_types::{
     base_types::{ObjectID, SuiAddress},
     object::Object,
-    object::Object,
+    storage::ObjectStore,
 };
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
-
+use crate::authority::AuthorityStore;
+use crate::authority::authority_store_tables::LiveObject;
 // --- Configuration ---
 
 /// Known CLMM pool package IDs (Cetus, etc.)
@@ -58,6 +59,9 @@ pub enum SubscriptionRequest {
 
     #[serde(rename = "subscribe_all")]
     SubscribeAll,
+
+    #[serde(rename = "query_all_fields")]
+    QueryAllFields(ObjectID),
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -66,6 +70,13 @@ pub struct SerializableOutput {
     pub timestamp_ms: u64,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct FieldData {
+    pub field_id: ObjectID,
+    pub object_bytes: Vec<u8>,
+    pub object_type: String,
+}
+    
 // --- Stream Message Types ---
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type")]
@@ -137,6 +148,13 @@ pub enum StreamMessage {
         digest: String,
     },
 
+    #[serde(rename = "all_fields_response")]
+    AllFieldsResponse {
+        table_id: ObjectID,
+        fields: Vec<FieldData>,
+        total_count: usize,
+    },
+
     /// Error message
     #[serde(rename = "error")]
     Error { message: String },
@@ -144,6 +162,7 @@ pub enum StreamMessage {
     /// Raw output (for debugging)
     #[serde(rename = "raw")]
     Raw(SerializableOutput),
+
 }
 
 /// Payload for pool state updates
@@ -581,10 +600,6 @@ type ScanInProgress = Arc<DashMap<ObjectID, Arc<tokio::sync::Notify>>>;
 struct AppState {
     tx: broadcast::Sender<Arc<TransactionOutputs>>,
     store: Arc<AuthorityStore>,
-    /// Write-through cache for table fields: table_id -> fields
-    fields_cache: TableFieldsCache,
-    /// Tracks tables currently being scanned
-    scan_in_progress: ScanInProgress,
 }
 
 // --- Main Broadcaster Logic ---
@@ -592,7 +607,7 @@ struct AppState {
 pub struct CustomBroadcaster;
 
 impl CustomBroadcaster {
-    pub fn spawn(mut rx: mpsc::Receiver<Arc<TransactionOutputs>>, port: u16) {
+    pub fn spawn(mut rx: mpsc::Receiver<Arc<TransactionOutputs>>, authority_store: Arc<AuthorityStore>, port: u16) {
         let (tx, _) = broadcast::channel(10000);
         let tx_clone = tx.clone();
 
@@ -611,7 +626,7 @@ impl CustomBroadcaster {
         });
 
         // Spawn the WebServer
-        let app_state = Arc::new(AppState { tx });
+        let app_state = Arc::new(AppState { tx, store: authority_store });
 
         tokio::spawn(async move {
             let app = Router::new()
@@ -885,6 +900,33 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                                                 info!("CustomBroadcaster: Client subscribed to all updates");
                                                                 subscribe_all = true;
                                                             }
+
+                                                            SubscriptionRequest::QueryAllFields(table_id) => {
+                                                                info!("Client querying all fields for table: {}", table_id);
+                                                                
+                                                                // 執行掃描並直接發送（不要 clone socket）
+                                                                let store = state.store.clone();
+                                                                
+                                                                match scan_all_fields(&store, table_id).await {
+                                                                    Ok(fields) => {
+                                                                        let msg = StreamMessage::AllFieldsResponse {
+                                                                            table_id,
+                                                                            total_count: fields.len(),
+                                                                            fields,
+                                                                        };
+                                                                        if send_json(&mut socket, &msg).await.is_err() {
+                                                                            break;
+                                                                        }
+                                                                    }
+                                                                    Err(e) => {
+                                                                        error!("Failed to scan fields: {:?}", e);
+                                                                        let err_msg = StreamMessage::Error {
+                                                                            message: format!("Failed to scan fields: {}", e),
+                                                                        };
+                                                                        let _ = send_json(&mut socket, &err_msg).await;
+                                                                    }
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                     Err(e) => {
@@ -930,6 +972,44 @@ async fn send_json<T: Serialize>(socket: &mut WebSocket, msg: &T) -> Result<(), 
     })
 }
 
+async fn scan_all_fields(
+    store: &Arc<AuthorityStore>,
+    table_id: ObjectID,
+) -> Result<Vec<FieldData>, anyhow::Error> {
+    // 在獨立任務中執行，避免阻塞
+    let store = store.clone();
+    let table_id_copy = table_id;
+    
+    tokio::task::spawn_blocking(move || {
+        let mut fields = Vec::new();
+        
+        // 遍歷所有存活的物件
+        let iter = store.perpetual_tables.iter_live_object_set(false);
+        
+        for live_obj in iter {
+            // 只處理正常物件（非 wrapped）
+            if let LiveObject::Normal(obj) = live_obj {
+                // 檢查 owner 是否為我們的 table
+                if let Owner::ObjectOwner(parent_addr) = obj.owner {
+                    if ObjectID::from(parent_addr) == table_id_copy {
+                        // 這是我們要的 dynamic field
+                        if let Some(move_obj) = obj.data.try_as_move() {
+                            fields.push(FieldData {
+                                field_id: obj.id(),
+                                object_bytes: move_obj.contents().to_vec(),
+                                object_type: move_obj.type_().to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        
+        info!("Found {} fields for table {}", fields.len(), table_id_copy);
+        Ok(fields)
+    })
+    .await?
+}
 #[cfg(test)]
 mod tests {
     use super::*;
