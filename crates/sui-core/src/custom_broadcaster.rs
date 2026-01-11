@@ -195,8 +195,17 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
 
                          // 3. Pool Updates (Written Objects)
                          // We iterate through written objects to see if any match our subscribed pools
+                         // Debug: Log all written object IDs
+                         let written_ids: Vec<_> = outputs.written.keys().map(|id| id.to_string()).collect();
+                         debug!("CustomBroadcaster: Tx {} wrote {} objects: {:?}",
+                             digest,
+                             outputs.written.len(),
+                             written_ids
+                         );
+
                          for (id, object) in &outputs.written {
                              if subscriptions_pools.contains(id) {
+                                  info!("CustomBroadcaster: Match! Sending pool update for {}", id);
                                   let object_bytes = object.data.try_as_move().map(|o| o.contents().to_vec());
                                   let msg = StreamMessage::PoolUpdate {
                                       pool_id: *id,
