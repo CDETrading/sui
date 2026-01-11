@@ -86,13 +86,27 @@ impl CustomBroadcaster {
         let (tx, _) = broadcast::channel(1000);
         let tx_clone = tx.clone();
 
+        // Target pool for detailed logging (user's test pool)
+        let target_pool = ObjectID::from_hex_literal(
+            "0x968f1f73b8e766e2ce0198c807d0c956aa384bfe64c98a18e56bfb970a13e7bb",
+        )
+        .ok();
+
         // 1. Spawn the ingestion loop
         tokio::spawn(async move {
             info!("CustomBroadcaster: Ingestion loop started");
             while let Some(outputs) = rx.recv().await {
-                // Determine if this output is "interesting" before broadcasting?
-                // Or broadcast everything and let per-client filters handle it?
-                // For low latency, we broadcast raw or minimally processed data.
+                // Log if the target pool is in this transaction's written objects
+                if let Some(target) = &target_pool {
+                    if let Some(obj) = outputs.written.get(target) {
+                        info!(
+                            "CustomBroadcaster: [POOL UPDATE] pool={} version={} tx={}",
+                            target,
+                            obj.version(),
+                            outputs.transaction.digest()
+                        );
+                    }
+                }
 
                 // We broadcast the Arc directly to avoid cloning the heavy data structure.
                 // The serialization happens in the client handling task.
