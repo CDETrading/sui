@@ -919,23 +919,6 @@ impl WritebackCache {
 
     #[instrument(level = "debug", skip_all)]
     fn write_transaction_outputs(&self, epoch_id: EpochId, tx_outputs: Arc<TransactionOutputs>) {
-        // [NEW] Broadcast hook
-        // "Identify the module... insert a hook that sends the state update"
-        // "This hook MUST NOT: block, await, panic"
-        if let Some(tx) = &self.broadcaster_tx {
-            // try_send is non-blocking. If full, it returns error (dropped).
-            // "If the channel is full, the update should be dropped with a log warning."
-            if let Err(e) = tx.try_send(tx_outputs.clone()) {
-                use tokio::sync::mpsc::error::TrySendError;
-                match e {
-                    TrySendError::Full(_) => {
-                        tracing::warn!("CustomBroadcaster channel full, dropping update")
-                    }
-                    TrySendError::Closed(_) => tracing::warn!("CustomBroadcaster channel closed"),
-                }
-            }
-        }
-
         let tx_digest = *tx_outputs.transaction.digest();
         trace!(?tx_digest, "writing transaction outputs to cache");
 
@@ -1069,6 +1052,23 @@ impl WritebackCache {
         );
 
         self.set_backpressure(pending_count);
+
+        // Broadcast AFTER cache writes complete so gRPC can read the new state
+        // when clients receive the WS notification
+        if let Some(tx) = &self.broadcaster_tx {
+            if let Err(e) = tx.try_send(tx_outputs.clone()) {
+                use tokio::sync::mpsc::error::TrySendError;
+                match e {
+                    TrySendError::Full(_) => {
+                        tracing::warn!(
+                            "CustomBroadcaster channel full, dropping update for {:?}",
+                            tx_digest
+                        )
+                    }
+                    TrySendError::Closed(_) => tracing::warn!("CustomBroadcaster channel closed"),
+                }
+            }
+        }
     }
 
     fn build_db_batch(&self, epoch: EpochId, digests: &[TransactionDigest]) -> Batch {
@@ -2347,6 +2347,22 @@ impl ExecutionCacheWrite for WritebackCache {
             .insert(tx_digest, tx_outputs.clone());
         self.fastpath_transaction_outputs_notify_read
             .notify(&tx_digest, &tx_outputs);
+
+        // Broadcast to custom broadcaster for fastpath transactions (owned objects like CLMM pools)
+        if let Some(tx) = &self.broadcaster_tx {
+            if let Err(e) = tx.try_send(tx_outputs.clone()) {
+                use tokio::sync::mpsc::error::TrySendError;
+                match e {
+                    TrySendError::Full(_) => {
+                        tracing::warn!(
+                            "CustomBroadcaster channel full, dropping fastpath update for {:?}",
+                            tx_digest
+                        )
+                    }
+                    TrySendError::Closed(_) => tracing::warn!("CustomBroadcaster channel closed"),
+                }
+            }
+        }
     }
 
     #[cfg(test)]
