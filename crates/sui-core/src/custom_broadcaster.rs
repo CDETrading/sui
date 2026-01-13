@@ -20,7 +20,6 @@ use sui_types::object::Owner;
 use sui_types::{
     base_types::{ObjectID, SuiAddress},
     object::Object,
-    storage::ObjectStore,
 };
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
@@ -600,6 +599,10 @@ type ScanInProgress = Arc<DashMap<ObjectID, Arc<tokio::sync::Notify>>>;
 struct AppState {
     tx: broadcast::Sender<Arc<TransactionOutputs>>,
     store: Arc<AuthorityStore>,
+    /// Write-through cache for table fields: table_id -> fields
+    fields_cache: TableFieldsCache,
+    /// Tracks tables currently being scanned
+    scan_in_progress: ScanInProgress,
 }
 
 // --- Main Broadcaster Logic ---
@@ -611,10 +614,18 @@ impl CustomBroadcaster {
         let (tx, _) = broadcast::channel(10000);
         let tx_clone = tx.clone();
 
-        // Spawn the ingestion loop
+        // Create the write-through cache for table fields
+        let fields_cache: TableFieldsCache = Arc::new(DashMap::new());
+        let fields_cache_clone = fields_cache.clone();
+        let scan_in_progress: ScanInProgress = Arc::new(DashMap::new());
+
+        // Spawn the ingestion loop with cache updates
         tokio::spawn(async move {
             info!("CustomBroadcaster: Ingestion loop started with write-through cache");
             while let Some(outputs) = rx.recv().await {
+                // Update cache for any written objects that are dynamic fields
+                Self::update_cache_from_outputs(&outputs, &fields_cache_clone);
+
                 if let Err(e) = tx_clone.send(outputs) {
                     debug!(
                         "CustomBroadcaster: No active subscribers, dropped message: {}",
@@ -626,7 +637,12 @@ impl CustomBroadcaster {
         });
 
         // Spawn the WebServer
-        let app_state = Arc::new(AppState { tx, store: authority_store });
+        let app_state = Arc::new(AppState {
+            tx,
+            store: authority_store,
+            fields_cache,
+            scan_in_progress,
+        });
 
         tokio::spawn(async move {
             let app = Router::new()
@@ -903,11 +919,13 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
 
                                                             SubscriptionRequest::QueryAllFields { table_id } => {
                                                                 info!("Client querying all fields for table: {}", table_id);
-                                                                
-                                                                // 執行掃描並直接發送（不要 clone socket）
+
+                                                                // Use cached query (first request scans, subsequent requests serve from cache)
                                                                 let store = state.store.clone();
-                                                                
-                                                                match scan_all_fields(&store, table_id).await {
+                                                                let cache = state.fields_cache.clone();
+                                                                let scan_progress = state.scan_in_progress.clone();
+
+                                                                match query_all_fields_cached(&store, table_id, &cache, &scan_progress).await {
                                                                     Ok(fields) => {
                                                                         let msg = StreamMessage::AllFieldsResponse {
                                                                             table_id,
@@ -919,9 +937,9 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                                                         }
                                                                     }
                                                                     Err(e) => {
-                                                                        error!("Failed to scan fields: {:?}", e);
+                                                                        error!("Failed to query fields: {:?}", e);
                                                                         let err_msg = StreamMessage::Error {
-                                                                            message: format!("Failed to scan fields: {}", e),
+                                                                            message: format!("Failed to query fields: {}", e),
                                                                         };
                                                                         let _ = send_json(&mut socket, &err_msg).await;
                                                                     }
@@ -972,63 +990,137 @@ async fn send_json<T: Serialize>(socket: &mut WebSocket, msg: &T) -> Result<(), 
     })
 }
 
-async fn scan_all_fields(
+/// Query all fields for a table with write-through caching
+/// - First request: performs full DB scan and caches results
+/// - Subsequent requests: serve directly from cache
+async fn query_all_fields_cached(
     store: &Arc<AuthorityStore>,
     table_id: ObjectID,
+    cache: &TableFieldsCache,
+    scan_in_progress: &ScanInProgress,
 ) -> Result<Vec<FieldData>, anyhow::Error> {
-    // 在獨立任務中執行，避免阻塞
-    let store = store.clone();
-    let table_id_copy = table_id;
-    
-tokio::task::spawn_blocking(move || {
-    let mut fields = Vec::new();
-    let mut scanned = 0usize;
-    let mut matched = 0usize;
-
-    let iter = store.perpetual_tables.iter_live_object_set(false);
-
-    for live_obj in iter {
-        scanned += 1;
-
-        if scanned % 100 == 0 {
+    // Fast path: check if already cached and ready
+    if let Some(entry) = cache.get(&table_id) {
+        if let (CacheStatus::Ready, fields) = entry.value() {
             info!(
-                "scan_all_fields: scanned {} objects so far, matched {}",
-                scanned, matched
+                "query_all_fields_cached: serving {} fields from cache for table {}",
+                fields.len(),
+                table_id
             );
-        }
-
-        if let LiveObject::Normal(obj) = live_obj {
-            if let Owner::ObjectOwner(parent_addr) = obj.owner {
-                if ObjectID::from(parent_addr) == table_id_copy {
-                    matched += 1;
-
-                    if let Some(move_obj) = obj.data.try_as_move() {
-                        fields.push(FieldData {
-                            field_id: obj.id(),
-                            object_bytes: move_obj.contents().to_vec(),
-                            object_type: move_obj.type_().to_string(),
-                        });
-                    }
-
-                    // 命中 table 時印一次（重要）
-                    debug!(
-                        "Matched dynamic field: field_id={}",
-                        obj.id()
-                    );
-                }
-            }
+            return Ok(fields.values().cloned().collect());
         }
     }
 
+    // Check if a scan is already in progress for this table
+    if let Some(notify) = scan_in_progress.get(&table_id) {
+        let notify = notify.clone();
+        drop(notify); // Release the lock
+        info!(
+            "query_all_fields_cached: waiting for in-progress scan for table {}",
+            table_id
+        );
+        // Wait for the scan to complete (with timeout)
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3600), // 1 hour timeout
+            async {
+                loop {
+                    if let Some(entry) = cache.get(&table_id) {
+                        if matches!(entry.value().0, CacheStatus::Ready) {
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            },
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Timeout waiting for scan to complete"))?;
+
+        // Now the cache should be ready
+        if let Some(entry) = cache.get(&table_id) {
+            if let (CacheStatus::Ready, fields) = entry.value() {
+                return Ok(fields.values().cloned().collect());
+            }
+        }
+        return Err(anyhow::anyhow!("Cache not ready after waiting"));
+    }
+
+    // No cache and no scan in progress - start a new scan
+    let notify = Arc::new(tokio::sync::Notify::new());
+    scan_in_progress.insert(table_id, notify.clone());
+
+    // Mark as loading in cache
+    cache.insert(table_id, (CacheStatus::Loading, HashMap::new()));
+
     info!(
-        "scan_all_fields finished: scanned {} objects, found {} fields for table {}",
-        scanned, matched, table_id_copy
+        "query_all_fields_cached: starting initial scan for table {}",
+        table_id
     );
 
-    Ok(fields)
-})
-.await?
+    // Perform the scan in a blocking task
+    let store = store.clone();
+    let table_id_copy = table_id;
+    let cache_clone = cache.clone();
+    let scan_in_progress_clone = scan_in_progress.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut fields_map: HashMap<ObjectID, FieldData> = HashMap::new();
+        let mut scanned = 0usize;
+        let mut matched = 0usize;
+
+        let iter = store.perpetual_tables.iter_live_object_set(false);
+
+        for live_obj in iter {
+            scanned += 1;
+
+            if scanned % 1_000_000 == 0 {
+                info!(
+                    "scan_all_fields: scanned {} objects so far, matched {}",
+                    scanned, matched
+                );
+            }
+
+            if let LiveObject::Normal(obj) = live_obj {
+                if let Owner::ObjectOwner(parent_addr) = obj.owner {
+                    if ObjectID::from(parent_addr) == table_id_copy {
+                        matched += 1;
+
+                        if let Some(move_obj) = obj.data.try_as_move() {
+                            let field_data = FieldData {
+                                field_id: obj.id(),
+                                object_bytes: move_obj.contents().to_vec(),
+                                object_type: move_obj.type_().to_string(),
+                            };
+                            fields_map.insert(obj.id(), field_data);
+                        }
+
+                        debug!("Matched dynamic field: field_id={}", obj.id());
+                    }
+                }
+            }
+        }
+
+        info!(
+            "scan_all_fields finished: scanned {} objects, found {} fields for table {}",
+            scanned, matched, table_id_copy
+        );
+
+        // Update cache with results
+        cache_clone.insert(table_id_copy, (CacheStatus::Ready, fields_map.clone()));
+
+        // Remove from scan_in_progress
+        scan_in_progress_clone.remove(&table_id_copy);
+
+        Ok::<Vec<FieldData>, anyhow::Error>(fields_map.into_values().collect())
+    })
+    .await??;
+
+    // Notify any waiters
+    notify.notify_waiters();
+
+    Ok(result)
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
