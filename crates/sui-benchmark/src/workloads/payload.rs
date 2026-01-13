@@ -67,6 +67,14 @@ pub enum ConcurrentTransactionResult {
     Failure { error: String },
 }
 
+/// Result for a single transaction in a concurrent batch.
+pub enum ConcurrentTransactionResult {
+    /// Transaction executed successfully with effects.
+    Success { effects: Box<ExecutionEffects> },
+    /// Transaction failed with an error message.
+    Failure { error: String },
+}
+
 /// A Payload is a transaction wrapper of a particular type (transfer object, shared counter, etc).
 /// Calling `make_transaction()` on a payload produces the transaction it is wrapping. Once that
 /// transaction is returned with effects (by quorum driver), a new payload can be generated with that
