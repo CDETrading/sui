@@ -39,6 +39,7 @@ pub enum StreamMessage {
     PoolUpdate {
         pool_id: ObjectID,
         digest: String,
+        version: u64,
         object: Option<Vec<u8>>,
     },
     AccountActivity {
@@ -86,27 +87,13 @@ impl CustomBroadcaster {
         let (tx, _) = broadcast::channel(1000);
         let tx_clone = tx.clone();
 
-        // Target pool for detailed logging (user's test pool)
-        let target_pool = ObjectID::from_hex_literal(
-            "0x968f1f73b8e766e2ce0198c807d0c956aa384bfe64c98a18e56bfb970a13e7bb",
-        )
-        .ok();
-
         // 1. Spawn the ingestion loop
         tokio::spawn(async move {
             info!("CustomBroadcaster: Ingestion loop started");
             while let Some(outputs) = rx.recv().await {
-                // Log if the target pool is in this transaction's written objects
-                if let Some(target) = &target_pool {
-                    if let Some(obj) = outputs.written.get(target) {
-                        info!(
-                            "CustomBroadcaster: [POOL UPDATE] pool={} version={} tx={}",
-                            target,
-                            obj.version(),
-                            outputs.transaction.digest()
-                        );
-                    }
-                }
+                // Determine if this output is "interesting" before broadcasting?
+                // Or broadcast everything and let per-client filters handle it?
+                // For low latency, we broadcast raw or minimally processed data.
 
                 // We broadcast the Arc directly to avoid cloning the heavy data structure.
                 // The serialization happens in the client handling task.
@@ -209,21 +196,14 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
 
                          // 3. Pool Updates (Written Objects)
                          // We iterate through written objects to see if any match our subscribed pools
-                         // Debug: Log all written object IDs
-                         let written_ids: Vec<_> = outputs.written.keys().map(|id| id.to_string()).collect();
-                         debug!("CustomBroadcaster: Tx {} wrote {} objects: {:?}",
-                             digest,
-                             outputs.written.len(),
-                             written_ids
-                         );
-
                          for (id, object) in &outputs.written {
                              if subscriptions_pools.contains(id) {
-                                  info!("CustomBroadcaster: Match! Sending pool update for {}", id);
                                   let object_bytes = object.data.try_as_move().map(|o| o.contents().to_vec());
+                                  let version = object.version().value();
                                   let msg = StreamMessage::PoolUpdate {
                                       pool_id: *id,
                                       digest: digest.to_string(),
+                                      version,
                                       object: object_bytes,
                                   };
                                   if let Err(_) = send_json(&mut socket, &msg).await { break; }
