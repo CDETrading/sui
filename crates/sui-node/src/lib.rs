@@ -555,7 +555,7 @@ impl SuiNode {
 
         // Spawn the broadcaster
         // "Spawn a new thread or task that runs the broadcaster"
-        CustomBroadcaster::spawn(broadcaster_rx, store.clone(), 9002);
+        CustomBroadcaster::spawn(broadcaster_rx, 9002, Some(store.clone()));
 
         let cache_traits = build_execution_cache(
             &config.execution_cache,
