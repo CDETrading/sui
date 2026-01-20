@@ -11,13 +11,34 @@ fn find_dependency_proto_dir(package_name: &str, subpath: &str) -> PathBuf {
     let crate_path = PathBuf::from(&crate_dir);
     let workspace_root = crate_path.parent().unwrap().parent().unwrap();
 
-    let mut cmd = std::process::Command::new("cargo");
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsStr::new("cargo").to_os_string());
+    let mut cmd = std::process::Command::new(cargo);
     cmd.arg("metadata")
         .arg("--format-version=1")
         .current_dir(workspace_root);
+    if workspace_root.join("Cargo.lock").exists() {
+        // Avoid network updates during build scripts.
+        cmd.arg("--locked");
+    }
     let output = cmd.output().expect("Failed to run cargo metadata");
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("Failed to parse cargo metadata");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        panic!(
+            "cargo metadata failed (status: {status})\n--- stderr ---\n{stderr}\n--- stdout ---\n{stdout}",
+            status = output.status
+        );
+    }
+    if output.stdout.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!(
+            "cargo metadata returned empty stdout\n--- stderr ---\n{stderr}",
+            stderr = stderr
+        );
+    }
+
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("Failed to parse cargo metadata JSON output");
 
     let package = metadata["packages"]
         .as_array()
