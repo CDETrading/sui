@@ -24,6 +24,7 @@ pub mod execution_cache;
 mod execution_driver;
 pub mod execution_scheduler;
 mod fallback_fetch;
+pub mod field_data_query;
 pub mod global_state_hasher;
 pub mod jsonrpc_index;
 pub mod metrics;
