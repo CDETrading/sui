@@ -10,6 +10,7 @@ use sui_types::{
     error::SuiResult,
     TypeTag,
 };
+use tracing::{debug, info};
 
 use crate::authority::authority_store_tables::AuthorityPerpetualTables;
 
@@ -47,8 +48,38 @@ pub fn query_field_data_range(
 
     let mut results = HashMap::new();
 
+    let total_to_scan = upper_index.saturating_sub(lower_index).saturating_add(1);
+    info!(
+        table_id = %table_id,
+        current_index,
+        range,
+        lower_index,
+        upper_index,
+        parent_version = %parent_version,
+        total_to_scan,
+        "query_field_data_range: start"
+    );
+
+    let mut scanned: u64 = 0;
+    let mut misses: u64 = 0;
+    const LOG_EVERY: u64 = 10_000;
+
     // Iterate through all indices in the range
     for index in lower_index..=upper_index {
+        scanned = scanned.saturating_add(1);
+        if scanned % LOG_EVERY == 0 {
+            debug!(
+                table_id = %table_id,
+                current_index,
+                range,
+                scanned,
+                total_to_scan,
+                hits = results.len(),
+                misses,
+                "query_field_data_range: progress"
+            );
+        }
+
         // Serialize the index as BCS bytes
         let key_bytes = bcs::to_bytes(&index)
             .map_err(|e| {
@@ -82,8 +113,23 @@ pub fn query_field_data_range(
                 };
                 results.insert(index, field_data);
             }
+        } else {
+            misses = misses.saturating_add(1);
         }
     }
+
+    info!(
+        table_id = %table_id,
+        current_index,
+        range,
+        lower_index,
+        upper_index,
+        parent_version = %parent_version,
+        scanned,
+        hits = results.len(),
+        misses,
+        "query_field_data_range: done"
+    );
 
     Ok(results)
 }

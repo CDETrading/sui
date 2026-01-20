@@ -336,7 +336,32 @@ async fn handle_field_range_query(
     use sui_types::base_types::SequenceNumber;
     use sui_types::TypeTag;
 
+    let started = tokio::time::Instant::now();
+
+    info!(
+        table_id = %table_id,
+        current_index,
+        range,
+        parent_version,
+        "CustomBroadcaster: QueryFieldRange request received"
+    );
+
+    if range >= 1_000_000 {
+        warn!(
+            table_id = %table_id,
+            current_index,
+            range,
+            "CustomBroadcaster: QueryFieldRange has very large range; may be slow"
+        );
+    }
+
     let Some(store) = &state.store else {
+        warn!(
+            table_id = %table_id,
+            current_index,
+            range,
+            "CustomBroadcaster: Field query not supported (store not available)"
+        );
         let err = StreamMessage::Error {
             message: "Field query not supported: store not available".to_string(),
         };
@@ -365,7 +390,12 @@ async fn handle_field_range_query(
     ) {
         Ok(field_data) => {
             let total_fields = field_data.len();
-            info!("Found {} fields", total_fields);
+            info!(
+                table_id = %table_id,
+                total_fields,
+                elapsed_ms = started.elapsed().as_millis(),
+                "CustomBroadcaster: QueryFieldRange completed"
+            );
 
             // Send each field as a separate message
             for (index, data) in field_data {
@@ -391,7 +421,12 @@ async fn handle_field_range_query(
             let _ = send_json(socket, &complete).await;
         }
         Err(e) => {
-            error!("Field range query failed: {}", e);
+            error!(
+                table_id = %table_id,
+                elapsed_ms = started.elapsed().as_millis(),
+                "CustomBroadcaster: QueryFieldRange failed: {}",
+                e
+            );
             let err = StreamMessage::Error {
                 message: format!("Query failed: {}", e),
             };
