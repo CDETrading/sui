@@ -48,41 +48,61 @@ pub fn query_field_data_range(
 
     let mut results = HashMap::new();
 
-    // Iterate through all indices in the range
-    for index in lower_index..=upper_index {
-        // Serialize the index as BCS bytes
-        let key_bytes = bcs::to_bytes(&index)
-            .map_err(|e| {
-                sui_types::error::SuiErrorKind::ObjectSerializationError {
-                    error: format!("Failed to serialize index {}: {}", index, e),
-                }
-            })?;
+    let span = info_span!(
+        "query_field_data_range",
+        table_id = %table_id,
+        current_index,
+        range,
+        parent_version = parent_version.value(),
+        key_type = ?key_type,
+    );
+    let _enter = span.enter();
 
-        // Derive the field ID using the same hash function as Move
-        let field_id = derive_dynamic_field_id(
-            table_id,
-            key_type,
-            &key_bytes,
-        ).map_err(|e| {
+    for index in lower_index..=upper_index {
+        let key_bytes = bcs::to_bytes(&index).map_err(|e| {
             sui_types::error::SuiErrorKind::ObjectSerializationError {
-                error: format!("BCS error: {}", e),
+                error: format!("Failed to serialize index {}: {}", index, e),
             }
         })?;
 
-        // Try to find the object at or before parent_version
-        // This uses the reversed iterator to find the highest version <= parent_version
+        let field_id =
+            derive_dynamic_field_id(table_id, key_type, &key_bytes).map_err(|e| {
+                sui_types::error::SuiErrorKind::ObjectSerializationError {
+                    error: format!("BCS error: {}", e),
+                }
+            })?;
+
+        debug!(
+            index,
+            key_bytes = %hex::encode(&key_bytes),
+            field_id = %field_id,
+            "Derived dynamic field id"
+        );
+
         if let Some(obj) = store.find_object_lt_or_eq_version(field_id, parent_version)? {
-            // Verify the object is owned by the parent (validation happens in read_child_object)
-            // Extract BCS bytes from the object
+            let version = obj.version().value();
+
             if let Some(move_obj) = obj.data.try_as_move() {
-                let field_data = FieldData {
+                debug!(
                     index,
-                    field_id,
-                    bcs_bytes: move_obj.contents().to_vec(),
-                    version: obj.version(),
-                };
-                results.insert(index, field_data);
+                    field_id = %field_id,
+                    object_version = version,
+                    bcs_len = move_obj.contents().len(),
+                    "Dynamic field hit"
+                );
+
+                results.insert(
+                    index,
+                    FieldData {
+                        index,
+                        field_id,
+                        bcs_bytes: move_obj.contents().to_vec(),
+                        version: obj.version(),
+                    },
+                );
             }
+        } else {
+            trace!(index, field_id = %field_id, "Dynamic field miss");
         }
     }
 
@@ -141,33 +161,19 @@ pub fn query_field_data_range_validated(
         );
 
         // Use read_child_object which validates parent-child relationship
-        if let Some(obj) = store.find_object_lt_or_eq_version(field_id, parent_version)? {
-            let version = obj.version().value();
-
+        if let Some(obj) = resolver.read_child_object(&table_id, &field_id, parent_version)? {
             if let Some(move_obj) = obj.data.try_as_move() {
-                debug!(
-                    index,
-                    field_id = %field_id,
-                    object_version = version,
-                    bcs_len = move_obj.contents().len(),
-                    "Dynamic field hit"
-                );
-
-                results.insert(index, FieldData {
+                let field_data = FieldData {
                     index,
                     field_id,
                     bcs_bytes: move_obj.contents().to_vec(),
                     version: obj.version(),
-                });
+                };
+                results.insert(index, field_data);
             }
-        } else {
-            trace!(
-                index,
-                field_id = %field_id,
-                "Dynamic field miss"
-            );
         }
     }
+
     Ok(results)
 }
 
