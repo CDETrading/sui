@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 antithesis_sdk.workspace = true
 anyhow = { workspace = true, features = ["backtrace"] }
+hex = "0.4"
 arc-swap.workspace = true
 async-trait.workspace = true
 async-stream.workspace = true
