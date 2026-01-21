@@ -21,7 +21,6 @@ use tracing::{debug, error, info, warn};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
-#[serde(tag = "type")]
 pub enum SubscriptionRequest {
     #[serde(rename = "subscribe_pool")]
     SubscribePool { pool_id: ObjectID },
