@@ -3,6 +3,7 @@
 
 pub mod metrics;
 pub mod nodefw_client;
+#[cfg(test)]
 pub mod nodefw_test_server;
 pub mod policies;
 

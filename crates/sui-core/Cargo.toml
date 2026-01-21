@@ -9,13 +9,16 @@ edition = "2024"
 [lints]
 workspace = true
 
+[features]
+custom-broadcaster = ["dep:axum"]
+
 [dependencies]
 antithesis_sdk.workspace = true
 anyhow = { workspace = true, features = ["backtrace"] }
 arc-swap.workspace = true
 async-trait.workspace = true
 async-stream.workspace = true
-axum.workspace = true
+axum = { workspace = true, optional = true }
 bcs.workspace = true
 bincode.workspace = true
 bytes.workspace = true

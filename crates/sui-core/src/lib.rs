@@ -17,7 +17,30 @@ pub mod consensus_manager;
 pub mod consensus_throughput_calculator;
 pub(crate) mod consensus_types;
 pub mod consensus_validator;
+#[cfg(feature = "custom-broadcaster")]
 pub mod custom_broadcaster;
+
+#[cfg(not(feature = "custom-broadcaster"))]
+pub mod custom_broadcaster {
+	use crate::authority::AuthorityStore;
+	use crate::transaction_outputs::TransactionOutputs;
+	use std::sync::Arc;
+	use tokio::sync::mpsc;
+
+	pub struct CustomBroadcaster;
+
+	impl CustomBroadcaster {
+		pub fn spawn(
+			_rx: mpsc::Receiver<Arc<TransactionOutputs>>,
+			_port: u16,
+			_store: Option<Arc<AuthorityStore>>,
+		) {
+			tracing::info!(
+				"CustomBroadcaster disabled (enable feature `custom-broadcaster` in `sui-core`)"
+			);
+		}
+	}
+}
 pub mod db_checkpoint_handler;
 pub mod epoch;
 pub mod execution_cache;
