@@ -23,6 +23,25 @@ pub struct FieldData {
     pub version: SequenceNumber,
 }
 
+fn encode_key_bytes(index: u64, key_type: &TypeTag) -> Result<Vec<u8>, bcs::Error> {
+    match key_type {
+        TypeTag::U64 => {
+            // For U64 keys, encode as u64 (8 bytes)
+            bcs::to_bytes(&index)
+        }
+        TypeTag::Struct(_) => {
+            // For struct keys (e.g., I32), encode as u32 (4 bytes)
+            // This assumes the struct wraps a u32 field (like I32 { bits: u32 })
+            let index_u32 = index as u32;
+            bcs::to_bytes(&index_u32)
+        }
+        _ => {
+            // Default to u64 for other types
+            bcs::to_bytes(&index)
+        }
+    }
+}
+
 /// Query dynamic field objects in a range around the current_index
 ///
 /// # Arguments
@@ -59,7 +78,7 @@ pub fn query_field_data_range(
     let _enter = span.enter();
 
     for index in lower_index..=upper_index {
-        let key_bytes = bcs::to_bytes(&index).map_err(|e| {
+        let key_bytes = encode_key_bytes(index, key_type).map_err(|e| {
             sui_types::error::SuiErrorKind::ObjectSerializationError {
                 error: format!("Failed to serialize index {}: {}", index, e),
             }
@@ -136,7 +155,7 @@ pub fn query_field_data_range_validated(
     let _enter = span.enter();
     
     for index in lower_index..=upper_index {
-        let key_bytes = bcs::to_bytes(&index)
+        let key_bytes = encode_key_bytes(index, key_type)
             .map_err(|e| {
                 sui_types::error::SuiErrorKind::ObjectSerializationError {
                     error: format!("BCS error: {}", e),
@@ -195,7 +214,7 @@ pub fn query_field_data_range_sparse(
     let mut consecutive_misses = 0;
 
     for index in lower_index..=upper_index {
-        let key_bytes = bcs::to_bytes(&index)
+        let key_bytes = encode_key_bytes(index, key_type)
             .map_err(|e| {
                 sui_types::error::SuiErrorKind::ObjectSerializationError {
                     error: format!("BCS error: {}", e),

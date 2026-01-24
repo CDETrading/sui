@@ -332,6 +332,11 @@ async fn handle_field_range_query(
     parent_version: Option<u64>,
 ) {
     use crate::field_data_query::query_field_data_range;
+    use move_core_types::{
+        account_address::AccountAddress,
+        identifier::Identifier,
+        language_storage::StructTag,
+    };
     use sui_types::base_types::SequenceNumber;
     use sui_types::TypeTag;
 
@@ -342,6 +347,19 @@ async fn handle_field_range_query(
         let _ = send_json(socket, &err).await;
         return;
     };
+
+    // Build the I32 struct type tag for the key
+    // Type: 0x70285592c97965e811e0c6f98dccc3a9c2b4ad854b3594faab9597ada267b860::i32::I32
+    let i32_struct = StructTag {
+        address: AccountAddress::from_hex_literal(
+            "0x70285592c97965e811e0c6f98dccc3a9c2b4ad854b3594faab9597ada267b860",
+        )
+        .expect("Valid I32 struct address"),
+        module: Identifier::new("i32").expect("Valid module name"),
+        name: Identifier::new("I32").expect("Valid struct name"),
+        type_params: vec![],
+    };
+    let key_type = TypeTag::Struct(Box::new(i32_struct));
 
     // Use parent_version if provided, otherwise use MAX (latest)
     let version = parent_version
@@ -360,7 +378,7 @@ async fn handle_field_range_query(
         current_index,
         range,
         version,
-        &TypeTag::U64, // Assuming U64 keys
+        &key_type, // Use the constructed key_type
     ) {
         Ok(field_data) => {
             let total_fields = field_data.len();
