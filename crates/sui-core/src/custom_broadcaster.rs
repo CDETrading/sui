@@ -39,6 +39,7 @@ pub enum StreamMessage {
     PoolUpdate {
         pool_id: ObjectID,
         digest: String,
+        version: u64,
         object: Option<Vec<u8>>,
     },
     AccountActivity {
@@ -198,9 +199,11 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                          for (id, object) in &outputs.written {
                              if subscriptions_pools.contains(id) {
                                   let object_bytes = object.data.try_as_move().map(|o| o.contents().to_vec());
+                                  let version = object.version().value();
                                   let msg = StreamMessage::PoolUpdate {
                                       pool_id: *id,
                                       digest: digest.to_string(),
+                                      version,
                                       object: object_bytes,
                                   };
                                   if let Err(_) = send_json(&mut socket, &msg).await { break; }
