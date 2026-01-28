@@ -49,10 +49,11 @@ pub enum SubscriptionRequest {
 pub enum StreamMessage {
     #[serde(rename = "pool_update")]
     PoolUpdate {
-        pool_id: ObjectID,
+        pool_id: String,
         digest: String,
         version: u64,
         object: Option<Vec<u8>>,
+        object_type: Option<String>,
     },
     #[serde(rename = "account_activity")]
     AccountActivity {
@@ -87,6 +88,14 @@ pub enum StreamMessage {
     QueryComplete {
         table_id: ObjectID,
         total_fields: usize,
+    },
+    #[serde(rename = "field_update")]
+    FieldUpdate {
+        pool_id: ObjectID,  // Parent table ID
+        field_id: ObjectID, // Field object ID
+        digest: String,
+        object: Option<Vec<u8>>, // Field<K,V> 的序列化資料
+        object_type: Option<String>,
     },
     #[serde(rename = "error")]
     Error { message: String },
@@ -234,20 +243,53 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
 
                          // 3. Pool Updates (Written Objects)
                          // We iterate through written objects to see if any match our subscribed pools
-                         for (id, object) in &outputs.written {
-                             if subscriptions_pools.contains(id) {
-                                  let object_bytes = object.data.try_as_move().map(|o| o.contents().to_vec());
-                                  let version = object.version().value();
-                                  let msg = StreamMessage::PoolUpdate {
-                                      pool_id: *id,
-                                      digest: digest.to_string(),
-                                      version,
-                                      object: object_bytes,
-                                  };
-                                  if let Err(_) = send_json(&mut socket, &msg).await { break; }
-                             }
-                         }
+                        for (id, object) in &outputs.written {
+                            if subscriptions_pools.contains(id) {
+                                let version = object.version().value();
+                                let (object_bytes, object_type) = if let Some(move_obj) = object.data.try_as_move() {
+                                    (
+                                        Some(move_obj.contents().to_vec()),
+                                        Some(move_obj.type_().to_string()),  // 獲取完整型別
+                                    )
+                                } else {
+                                    (None, None)
+                                };
 
+                                let msg = StreamMessage::PoolUpdate {
+                                    pool_id: id.to_string(),
+                                    digest: digest.to_string(),
+                                    version,
+                                    object: object_bytes,
+                                    object_type,  // 傳送型別資訊
+
+                                };
+                                if let Err(_) = send_json(&mut socket, &msg).await { break; }
+                            }
+
+                            // Dynamic field 檢查
+                            if let sui_types::object::Owner::ObjectOwner(parent_addr) = &object.owner {
+                                let parent_id = ObjectID::from(*parent_addr);
+                                if subscriptions_pools.contains(&parent_id) {
+                                    let (object_bytes, object_type) = if let Some(move_obj) = object.data.try_as_move() {
+                                        (
+                                            Some(move_obj.contents().to_vec()),
+                                            Some(move_obj.type_().to_string()),
+                                        )
+                                    } else {
+                                        (None, None)
+                                    };
+
+                                    let msg = StreamMessage::FieldUpdate {
+                                        pool_id: parent_id,
+                                        field_id: *id,
+                                        digest: digest.to_string(),
+                                        object: object_bytes,
+                                        object_type,
+                                    };
+                                    if let Err(_) = send_json(&mut socket, &msg).await { break; }
+                                }
+                            }
+                        }
                          // 4. Account Updates (Sender)
                          // Check if the sender is one of our subscribed accounts
                          let sender = outputs.transaction.sender_address();
