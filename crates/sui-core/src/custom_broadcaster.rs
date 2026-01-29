@@ -42,6 +42,13 @@ pub enum SubscriptionRequest {
         range: u64,
         parent_version: Option<u64>,
     },
+    #[serde(rename = "query_cetus_range")]
+    QueryCetusRange {
+        table_id: ObjectID,
+        current_index: u64,
+        range: u64,
+        parent_version: Option<u64>,
+    },
 }
 
 // ... (StreamMessage and AppState remain unchanged, I will skip them in replacement if possible, but I need to target the enum first)
@@ -375,6 +382,22 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                         )
                                         .await;
                                     }
+                                    SubscriptionRequest::QueryCetusRange {
+                                        table_id,
+                                        current_index,
+                                        range,
+                                        parent_version,
+                                    } => {
+                                        handle_cetus_range_query(
+                                            &mut socket,
+                                            &state,
+                                            table_id,
+                                            current_index,
+                                            range,
+                                            parent_version,
+                                        )
+                                        .await;
+                                    }
                                 }
                             }
                         } else if let Message::Close(_) = msg {
@@ -589,6 +612,88 @@ async fn handle_bluefin_range_query(
         }
         Err(e) => {
             error!("Bluefin field range query failed: {}", e);
+            let err = StreamMessage::Error {
+                message: format!("Query failed: {}", e),
+            };
+            let _ = send_json(socket, &err).await;
+        }
+    }
+}
+
+async fn handle_cetus_range_query(
+    socket: &mut WebSocket,
+    state: &Arc<AppState>,
+    table_id: ObjectID,
+    current_index: u64,
+    range: u64,
+    parent_version: Option<u64>,
+) {
+    use crate::field_data_query::query_field_data_range;
+    use sui_types::base_types::SequenceNumber;
+    use sui_types::TypeTag;
+
+    let Some(store) = &state.store else {
+        let err = StreamMessage::Error {
+            message: "Field query not supported: store not available".to_string(),
+        };
+        let _ = send_json(socket, &err).await;
+        return;
+    };
+
+    // Cetus: use U64 directly as key type
+    let key_type = TypeTag::U64;
+
+    let version = parent_version
+        .map(SequenceNumber::from_u64)
+        .unwrap_or(SequenceNumber::MAX);
+
+    info!(
+        "Querying CETUS field range: table={}, index={}, range=±{}, version={}",
+        table_id, current_index, range, version
+    );
+
+    match query_field_data_range(
+        &store.perpetual_tables,
+        table_id,
+        current_index,
+        range,
+        version,
+        &key_type,
+    ) {
+        Ok(field_data) => {
+            let total_fields = field_data.len();
+            info!(
+                table_id = %table_id,
+                current_index,
+                range,
+                parent_version = version.value(),
+                total_fields,
+                "Cetus field range query completed"
+            );
+
+            for (index, data) in field_data {
+                let msg = StreamMessage::FieldData {
+                    table_id,
+                    index,
+                    field_id: data.field_id,
+                    bcs_bytes: data.bcs_bytes,
+                    version: data.version.value(),
+                };
+
+                if send_json(socket, &msg).await.is_err() {
+                    error!("Failed to send cetus field data message");
+                    return;
+                }
+            }
+
+            let complete = StreamMessage::QueryComplete {
+                table_id,
+                total_fields,
+            };
+            let _ = send_json(socket, &complete).await;
+        }
+        Err(e) => {
+            error!("Cetus field range query failed: {}", e);
             let err = StreamMessage::Error {
                 message: format!("Query failed: {}", e),
             };
