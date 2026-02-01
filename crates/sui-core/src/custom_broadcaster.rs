@@ -12,10 +12,9 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 use sui_types::{
     base_types::{ObjectID, SuiAddress},
-    transaction::TransactionDataAPI, // Kept if needed for trait bounds, but suppressing warning if unused
 };
 use tokio::sync::{broadcast, mpsc};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 // --- Data Structures ---
 
@@ -438,7 +437,7 @@ async fn handle_field_range_query(
     use sui_types::base_types::SequenceNumber;
     use sui_types::TypeTag;
 
-    let Some(store) = &state.store else {
+    let Some(store) = state.store.as_ref().cloned() else {
         let err = StreamMessage::Error {
             message: "Field query not supported: store not available".to_string(),
         };
@@ -463,28 +462,37 @@ async fn handle_field_range_query(
     let version = parent_version
         .map(SequenceNumber::from_u64)
         .unwrap_or(SequenceNumber::MAX);
+    let version_u64 = version.value();
 
     info!(
         "Querying field range: table={}, index={}, range=±{}, version={}",
-        table_id, current_index, range, version
+        table_id, current_index, range, version_u64
     );
 
-    // Query the field data range
-    match query_field_data_range(
-        &store.perpetual_tables,
-        table_id,
-        current_index,
-        range,
-        version,
-        &key_type, // Use the constructed key_type
-    ) {
-        Ok(field_data) => {
+    // AuthorityPerpetualTables queries are synchronous (blocking). Run them on a blocking thread.
+    let query_join = tokio::task::spawn_blocking({
+        let key_type = key_type.clone();
+        move || {
+            query_field_data_range(
+                &store.perpetual_tables,
+                table_id,
+                current_index,
+                range,
+                version,
+                &key_type,
+            )
+        }
+    })
+    .await;
+
+    match query_join {
+        Ok(Ok(field_data)) => {
             let total_fields = field_data.len();
             info!(
                 table_id = %table_id,
                 current_index,
                 range,
-                parent_version = version.value(),
+                parent_version = version_u64,
                 total_fields,
                 "Field range query completed"
             );
@@ -513,10 +521,17 @@ async fn handle_field_range_query(
             };
             let _ = send_json(socket, &complete).await;
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             error!("Field range query failed: {}", e);
             let err = StreamMessage::Error {
                 message: format!("Query failed: {}", e),
+            };
+            let _ = send_json(socket, &err).await;
+        }
+        Err(join_err) => {
+            error!("Field range query task failed: {}", join_err);
+            let err = StreamMessage::Error {
+                message: format!("Query task failed: {}", join_err),
             };
             let _ = send_json(socket, &err).await;
         }
@@ -540,7 +555,7 @@ async fn handle_bluefin_range_query(
     use sui_types::base_types::SequenceNumber;
     use sui_types::TypeTag;
 
-    let Some(store) = &state.store else {
+    let Some(store) = state.store.as_ref().cloned() else {
         let err = StreamMessage::Error {
             message: "Field query not supported: store not available".to_string(),
         };
@@ -564,27 +579,36 @@ async fn handle_bluefin_range_query(
     let version = parent_version
         .map(SequenceNumber::from_u64)
         .unwrap_or(SequenceNumber::MAX);
+    let version_u64 = version.value();
 
     info!(
         "Querying BLUEFIN field range: table={}, index={}, range=±{}, version={}",
-        table_id, current_index, range, version
+        table_id, current_index, range, version_u64
     );
 
-    match query_field_data_range(
-        &store.perpetual_tables,
-        table_id,
-        current_index,
-        range,
-        version,
-        &key_type,
-    ) {
-        Ok(field_data) => {
+    let query_join = tokio::task::spawn_blocking({
+        let key_type = key_type.clone();
+        move || {
+            query_field_data_range(
+                &store.perpetual_tables,
+                table_id,
+                current_index,
+                range,
+                version,
+                &key_type,
+            )
+        }
+    })
+    .await;
+
+    match query_join {
+        Ok(Ok(field_data)) => {
             let total_fields = field_data.len();
             info!(
                 table_id = %table_id,
                 current_index,
                 range,
-                parent_version = version.value(),
+                parent_version = version_u64,
                 total_fields,
                 "Bluefin field range query completed"
             );
@@ -610,10 +634,17 @@ async fn handle_bluefin_range_query(
             };
             let _ = send_json(socket, &complete).await;
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             error!("Bluefin field range query failed: {}", e);
             let err = StreamMessage::Error {
                 message: format!("Query failed: {}", e),
+            };
+            let _ = send_json(socket, &err).await;
+        }
+        Err(join_err) => {
+            error!("Bluefin field range query task failed: {}", join_err);
+            let err = StreamMessage::Error {
+                message: format!("Query task failed: {}", join_err),
             };
             let _ = send_json(socket, &err).await;
         }
@@ -632,7 +663,7 @@ async fn handle_cetus_range_query(
     use sui_types::base_types::SequenceNumber;
     use sui_types::TypeTag;
 
-    let Some(store) = &state.store else {
+    let Some(store) = state.store.as_ref().cloned() else {
         let err = StreamMessage::Error {
             message: "Field query not supported: store not available".to_string(),
         };
@@ -646,27 +677,36 @@ async fn handle_cetus_range_query(
     let version = parent_version
         .map(SequenceNumber::from_u64)
         .unwrap_or(SequenceNumber::MAX);
+    let version_u64 = version.value();
 
     info!(
         "Querying CETUS field range: table={}, index={}, range=±{}, version={}",
-        table_id, current_index, range, version
+        table_id, current_index, range, version_u64
     );
 
-    match query_field_data_range(
-        &store.perpetual_tables,
-        table_id,
-        current_index,
-        range,
-        version,
-        &key_type,
-    ) {
-        Ok(field_data) => {
+    let query_join = tokio::task::spawn_blocking({
+        let key_type = key_type.clone();
+        move || {
+            query_field_data_range(
+                &store.perpetual_tables,
+                table_id,
+                current_index,
+                range,
+                version,
+                &key_type,
+            )
+        }
+    })
+    .await;
+
+    match query_join {
+        Ok(Ok(field_data)) => {
             let total_fields = field_data.len();
             info!(
                 table_id = %table_id,
                 current_index,
                 range,
-                parent_version = version.value(),
+                parent_version = version_u64,
                 total_fields,
                 "Cetus field range query completed"
             );
@@ -692,10 +732,17 @@ async fn handle_cetus_range_query(
             };
             let _ = send_json(socket, &complete).await;
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             error!("Cetus field range query failed: {}", e);
             let err = StreamMessage::Error {
                 message: format!("Query failed: {}", e),
+            };
+            let _ = send_json(socket, &err).await;
+        }
+        Err(join_err) => {
+            error!("Cetus field range query task failed: {}", join_err);
+            let err = StreamMessage::Error {
+                message: format!("Query task failed: {}", join_err),
             };
             let _ = send_json(socket, &err).await;
         }
